@@ -329,6 +329,18 @@ pub enum LaneExit {
     Indirect,
 }
 
+impl LaneExit {
+    pub fn successors(&self) -> Vec<usize> {
+        match *self {
+            LaneExit::Jump(b) => vec![b],
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => vec![],
+        }
+    }
+}
+
 /// A [`Program`] as one lane runs it: same blocks, per-lane branches.
 #[derive(Debug, Clone)]
 pub struct Structured {
@@ -362,6 +374,35 @@ impl Structured {
             None => self.masks.get(&low),
         }
         .copied()
+    }
+
+    /// Blocks reachable from entry in the per-lane control-flow graph, in
+    /// reverse postorder.
+    pub(crate) fn reverse_postorder(&self) -> Vec<usize> {
+        if self.exits.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = vec![false; self.exits.len()];
+        let mut post = Vec::with_capacity(self.exits.len());
+        let mut stack = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match self.exits[b].successors().get(i) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
     }
 }
 
@@ -614,11 +655,18 @@ impl<'a> Lanes<'a> {
                 Exit::Jump(t) => LaneExit::Jump(t),
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
-                Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
-                    taken,
-                    not_taken,
-                },
+                Exit::Branch { taken, not_taken } if taken == not_taken => LaneExit::Jump(taken),
+                Exit::Branch { taken, not_taken } => {
+                    match b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]) {
+                        Bool::TRUE => LaneExit::Jump(taken),
+                        Bool::FALSE => LaneExit::Jump(not_taken),
+                        when => LaneExit::Branch {
+                            when,
+                            taken,
+                            not_taken,
+                        },
+                    }
+                }
             })
             .collect();
         if self.b.overflow {
@@ -1230,5 +1278,42 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn constant_lane_branches_fold_to_jumps() {
+        // Always-not-taken s_cbranch_execz: ANDing EXEC with a saved copy of
+        // EXEC keeps every active lane, so the skip edge is dead.
+        let never_skip = build(
+            &[
+                0xBE80_037E, // s_mov_b32 s0, exec_lo
+                0xBE81_3C00, // s_and_saveexec_b32 s1, s0
+                0xBF88_0001, // s_cbranch_execz -> 16 (block 2)
+                0x7E02_0281, // 12 (block 1): v_mov_b32 v1, 1
+                0xBEFE_0301, // 16 (block 2): s_mov_b32 exec_lo, s1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&never_skip).unwrap();
+        assert_eq!(s.exits[0], LaneExit::Jump(1));
+        assert_eq!(s.reverse_postorder(), [0, 1, 2]);
+
+        // Always-taken s_cbranch_execz: ANDing EXEC with 0 clears every lane,
+        // so the fall-through body is dead and excluded from reverse postorder.
+        let always_skip = build(
+            &[
+                0xBE80_0380, // s_mov_b32 s0, 0
+                0xBE81_3C00, // s_and_saveexec_b32 s1, s0
+                0xBF88_0001, // s_cbranch_execz -> 16 (block 2)
+                0x7E02_0281, // 12 (block 1, dead): v_mov_b32 v1, 1
+                0xBEFE_0301, // 16 (block 2): s_mov_b32 exec_lo, s1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&always_skip).unwrap();
+        assert_eq!(s.exits[0], LaneExit::Jump(2));
+        assert_eq!(s.reverse_postorder(), [0, 2]);
     }
 }

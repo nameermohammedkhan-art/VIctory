@@ -170,6 +170,9 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
+        if !t.reachable[b] {
+            continue;
+        }
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             let fail = |what| ShaderError::Unsupported {
@@ -299,6 +302,9 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Blocks reachable from entry in the per-lane control-flow graph (all
+    /// blocks when `lanes` is absent).
+    reachable: Vec<bool>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -343,12 +349,15 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
+        let order = match lanes {
+            Some(l) => l.reverse_postorder(),
+            None => crate::ir::reverse_postorder(&p.blocks),
+        };
         let mut rpo = vec![usize::MAX; p.blocks.len()];
-        for (n, b) in crate::ir::reverse_postorder(&p.blocks)
-            .into_iter()
-            .enumerate()
-        {
+        let mut reachable = vec![false; p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
             rpo[b] = n;
+            reachable[b] = true;
         }
         let mut t = Tracer {
             p,
@@ -360,29 +369,48 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            reachable,
         };
-        t.origin = t.propagate_copies(n)?;
+        t.origin = t.propagate_copies(n, &order)?;
         Ok(t)
+    }
+
+    /// Whether predecessor `preds[j]` of `block` reaches `block` along a live
+    /// edge in the structured CFG.
+    fn live_pred(&self, block: usize, j: usize) -> bool {
+        let preds = &self.p.blocks[block].preds;
+        let q = preds[j];
+        if !self.reachable[q] {
+            return false;
+        }
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        if preds[..j].contains(&q) {
+            return false;
+        }
+        lanes.exits[q].successors().contains(&block)
     }
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
-    fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
+    fn propagate_copies(&self, n: usize, order: &[usize]) -> Result<Vec<Term>, ShaderError> {
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
-        let order = crate::ir::reverse_postorder(&self.p.blocks);
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
-            for &b in &order {
+            for &b in order {
                 let block = &self.p.blocks[b];
                 for phi in &block.phis {
                     let own = Term::Value(phi.value);
                     let mut args = phi
                         .args
                         .iter()
-                        .filter_map(|a| o[a.0 as usize])
+                        .enumerate()
+                        .filter(|&(j, _)| self.live_pred(b, j))
+                        .filter_map(|(_, a)| o[a.0 as usize])
                         .filter(|&t| t != own);
                     let new = args
                         .next()
@@ -875,6 +903,21 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
+        let live: Vec<usize> = (0..self.p.blocks[block].preds.len())
+            .filter(|&j| self.live_pred(block, j))
+            .collect();
+        if let [j] = live[..] {
+            let edge: Vec<Term> = words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect();
+            let res = self.classify(&edge, joins, known);
+            joins.pop();
+            return Ok(Some(res?));
+        }
         let args = (0..self.p.blocks[block].preds.len())
             .map(|j| {
                 let edge: Vec<Term> = words
@@ -1371,6 +1414,10 @@ impl<'a> Tracer<'a> {
         let phis = &self.p.blocks[block].phis;
         let mut args = Vec::new();
         for (j, &q) in preds.iter().enumerate() {
+            if !self.live_pred(block, j) {
+                args.push(None);
+                continue;
+            }
             let n = known.len();
             known.push((lanes.reach[q], true));
             if let LaneExit::Branch {
@@ -3049,5 +3096,31 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn descriptors_ignore_dead_structured_phi_edges() {
+        // An s_cbranch_execz whose mask is already implied by entry EXEC can
+        // never skip the body; the descriptor loaded in the body must not be
+        // poisoned by uninitialized SGPRs along the dead skip edge.
+        let r = track_words(
+            &[
+                0xBE82_0308, // s_mov_b32 s2, s8 (table base)
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBE86_037E, // s_mov_b32 s6, exec_lo
+                0xBE87_3C06, // s_and_saveexec_b32 s7, s6
+                0xBF88_0002, // s_cbranch_execz -> 0x1c (dead skip edge)
+                0xF408_0001, // 0x14: s_load_dwordx4 s[0:3], s[2:3], null
+                0xFA00_0000,
+                0xBEFE_0307, // 0x1c: s_mov_b32 exec_lo, s7
+                0xF420_0100, // 0x20: s_buffer_load_dword s4, s[0:3], null
+                0xFA00_0000,
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.descriptors.len(), 1);
+        assert!(matches!(r.descriptors[0].source, Source::Loaded { .. }));
     }
 }

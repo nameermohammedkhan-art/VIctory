@@ -354,7 +354,8 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
-        let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        let reachable = x.st.reverse_postorder();
+        let insts = || reachable.iter().flat_map(|&b| &p.blocks[b].insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -377,18 +378,15 @@ impl<'a> Lower<'a> {
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
-                let whens = x.st.exits.iter().filter_map(|e| match *e {
+                let whens = reachable.iter().filter_map(|&b| match x.st.exits[b] {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
                 });
-                let mut all: Vec<Bool> =
-                    x.st.guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .collect();
+                let mut all: Vec<Bool> = reachable
+                    .iter()
+                    .flat_map(|&b| x.st.guards[b].iter().flatten().copied())
+                    .chain(whens)
+                    .collect();
                 all.sort_unstable();
                 all.dedup();
                 all.into_iter().any(|g| {
@@ -673,6 +671,9 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
         for b in 0..p.blocks.len() {
+            if self.block[b].is_none() {
+                continue;
+            }
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
                 for i in start + 1..sec.end {
@@ -689,9 +690,15 @@ impl<'a> Lower<'a> {
             return;
         }
         for (b, block) in p.blocks.iter().enumerate() {
+            if self.block[b].is_none() {
+                continue;
+            }
             for phi in &block.phis {
-                self.section_out
-                    .extend(phi.args.iter().filter(|a| inside.contains_key(a)));
+                for (j, &a) in phi.args.iter().enumerate() {
+                    if self.live_pred(b, j) && inside.contains_key(&a) {
+                        self.section_out.insert(a);
+                    }
+                }
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 for &(_, r) in &inst.reads {
@@ -821,9 +828,17 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    fn live_pred(&self, to: usize, pred_index: usize) -> bool {
+        let preds = &self.x.p.blocks[to].preds;
+        let q = preds[pred_index];
+        self.block[q].is_some()
+            && !preds[..pred_index].contains(&q)
+            && self.x.st.exits[q].successors().contains(&to)
+    }
+
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
-        let order = crate::ir::reverse_postorder(&p.blocks);
+        let order = self.x.st.reverse_postorder();
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
@@ -839,7 +854,8 @@ impl<'a> Lower<'a> {
             let header = p.blocks[b]
                 .preds
                 .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
+                .enumerate()
+                .any(|(j, &q)| self.live_pred(b, j) && self.rpo[b] <= self.rpo[q]);
             if header {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
@@ -859,8 +875,9 @@ impl<'a> Lower<'a> {
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
-                .copied()
-                .filter(|&q| self.block[q].is_some())
+                .enumerate()
+                .filter(|&(j, _)| self.live_pred(b, j))
+                .map(|(_, &q)| q)
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
             for (i, phi) in p.blocks[b].phis.iter().enumerate() {
@@ -3371,8 +3388,8 @@ impl<'a> Lower<'a> {
                 // join picks one with a phi.
                 let _ = site;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
+                for (j, (&q, arg)) in self.x.p.blocks[*block].preds.iter().zip(args).enumerate() {
+                    if !self.live_pred(*block, j) {
                         continue;
                     }
                     let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
@@ -3454,8 +3471,8 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
+                for (j, (&q, arg)) in self.x.p.blocks[*block].preds.iter().zip(args).enumerate() {
+                    if !self.live_pred(*block, j) {
                         continue;
                     }
                     let tail =
@@ -6865,10 +6882,8 @@ impl<'a> Lower<'a> {
     /// The DXIL block a branch from IR block `from` to `to` goes to.
     fn edge(&mut self, from: usize, to: usize) -> usize {
         let target = self.block[to].expect("reachable");
-        let preds = self.x.p.blocks[to]
-            .preds
-            .iter()
-            .filter(|&&q| self.block[q].is_some())
+        let preds = (0..self.x.p.blocks[to].preds.len())
+            .filter(|&j| self.live_pred(to, j))
             .count();
         // Back edges stay as they are: the exiting block is the latch.
         if preds < 2 || self.rpo[to] <= self.rpo[from] {
@@ -6890,8 +6905,11 @@ impl<'a> Lower<'a> {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
-            for &arg in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+            for (j, &arg) in p.blocks[b].phis[i].args.iter().enumerate() {
+                if self.live_pred(b, j)
+                    && self.phi_at.contains_key(&arg)
+                    && self.read_phis.insert(arg)
+                {
                     work.push(arg);
                 }
             }
@@ -6901,6 +6919,9 @@ impl<'a> Lower<'a> {
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if !self.live_pred(b, n) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
@@ -6930,6 +6951,9 @@ impl<'a> Lower<'a> {
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                if !self.live_pred(b, n) {
+                    continue;
+                }
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let m =
@@ -7417,5 +7441,121 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn dead_structured_branch_does_not_poison_live_phi() {
+        // An always-taken s_cbranch_execz skips a dead block that writes
+        // s_getpc_b64's unlowered value into v1. Pruning the dead block keeps
+        // v1's live value clean at the join and produces valid DXIL.
+        let words = [
+            0x7E02_02AAu32, // v_mov_b32 v1, 42
+            0xBE80_0380,    // s_mov_b32 s0, 0
+            0xBE81_3C00,    // s_and_saveexec_b32 s1, s0
+            0xBF88_0002,    // s_cbranch_execz -> 0x18 (always taken)
+            0xBE82_1F00,    // 0x10 (dead): s_getpc_b64 s[2:3]
+            0x7E02_0203,    // 0x14 (dead): v_mov_b32 v1, s3
+            0xBEFE_0301,    // 0x18: s_mov_b32 exec_lo, s1
+            0xD834_0000,    // 0x1c: ds_write_b32 v0, v1
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let emitted = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("dead block's s_getpc_b64 must not poison live join");
+        #[cfg(windows)]
+        if let Some(path) = super::super::validator::Validator::default_path() {
+            let mut dxil = emitted.dxil;
+            let mut v = super::super::validator::Validator::load(Some(&path)).unwrap();
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(not(windows))]
+        let _ = emitted;
+    }
+
+    #[test]
+    fn dead_edge_descriptor_phi_lowers_and_validates() {
+        // An s_cbranch_execz whose skip edge is proved impossible leaves
+        // uninitialized SGPRs on the dead edge; lowering only the live edge
+        // emits valid DXIL.
+        let words = [
+            0xBE82_0308u32, // s_mov_b32 s2, s8 (table base)
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xBE86_037E,    // s_mov_b32 s6, exec_lo
+            0xBE87_3C06,    // s_and_saveexec_b32 s7, s6
+            0xBF88_0002,    // s_cbranch_execz -> 0x1c (dead skip edge)
+            0xF408_0001,    // 0x14: s_load_dwordx4 s[0:3], s[2:3], null
+            0xFA00_0000,
+            0xBEFE_0307,    // 0x1c: s_mov_b32 exec_lo, s7
+            0xF420_0100,    // 0x20: s_buffer_load_dword s4, s[0:3], null
+            0xFA00_0000,
+            0x7E02_0204,    // 0x28: v_mov_b32 v1, s4
+            0xD834_0000,    // 0x2c: ds_write_b32 v0, v1
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![root(RootType::Table, 8, 0)],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (1 << 15) | (9 << 1),
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let emitted = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .expect("dead skip edge must not poison descriptor phi");
+        #[cfg(windows)]
+        if let Some(path) = super::super::validator::Validator::default_path() {
+            let mut dxil = emitted.dxil;
+            let mut v = super::super::validator::Validator::load(Some(&path)).unwrap();
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(not(windows))]
+        let _ = emitted;
     }
 }

@@ -40,39 +40,10 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
-}
-
-/// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-/// An empty buffer with room for `n` bytes, from the pool if it has one.
-fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
-}
-
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
-fn give_back(v: Vec<u8>) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+    /// Persistent mirror of `self.data`, allocated once on the first shader
+    /// write to this buffer and kept in sync on CPU copies and copy-backs so
+    /// subsequent submissions avoid snapshotting the entire buffer.
+    mirror: Mutex<Option<Vec<u8>>>,
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -92,6 +63,14 @@ impl Shadow {
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
+    }
+
+    /// Whether this shadow overlaps the title range `[addr, addr + len)`.
+    pub(crate) fn overlaps(&self, addr: usize, len: usize) -> bool {
+        let start = self.start as usize;
+        let end = start.saturating_add(self.len as usize);
+        let req_end = addr.saturating_add(len);
+        start < req_end && end > addr
     }
 
     /// Offset of a title address from the buffer's start.
@@ -117,7 +96,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
-            before: Mutex::default(),
+            mirror: Mutex::default(),
         }
     }
 
@@ -143,118 +122,148 @@ impl Shadow {
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// write this range. Ensures the persistent mirror of `self.data` is
+    /// initialized once (subsequent submissions reuse it with zero full-buffer
+    /// memcpy) and records the range in `pending`.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
-        let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
+        let mut mirror = self.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        if mirror.is_none() {
+            // SAFETY: inside the persistent mapping of `self.len` bytes.
+            let host = unsafe { std::slice::from_raw_parts(self.data, self.len as usize) };
+            *mirror = Some(host.to_vec());
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
     }
 
-    /// After the submission ran: copies the bytes its shaders wrote back
-    /// into title memory (unmapped pages left alone), and only those: the
-    /// title's threads write the same buffers while the GPU runs (its
-    /// command memory shares the big GPU heap with what shaders write), and
-    /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let mut written = 0;
-        let (from, to) = self.inside(address, len);
+    /// After the submission ran: merges all pending shader-written ranges for
+    /// this shadow buffer into disjoint intervals, scans each byte at most
+    /// once against the persistent mirror (in parallel for large ranges),
+    /// copies only GPU-modified bytes back into title memory, and updates the
+    /// mirror in place. Returns the bytes written.
+    pub(crate) fn copy_back_pending(&self) -> usize {
+        let pending_ranges: Vec<(usize, usize)> = {
+            let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *p)
+        };
+        if pending_ranges.is_empty() {
+            return 0;
+        }
+        let mut intervals: Vec<(usize, usize)> = pending_ranges
+            .into_iter()
+            .filter_map(|(a, e)| {
+                let (from, to) = self.inside(a, e.saturating_sub(a));
+                (from < to).then_some((from, to))
+            })
+            .collect();
+        if intervals.is_empty() {
+            return 0;
+        }
+        intervals.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+        for (from, to) in intervals {
+            if let Some(last) = merged.last_mut()
+                && from <= last.1
+            {
+                last.1 = last.1.max(to);
+            } else {
+                merged.push((from, to));
+            }
+        }
+
+        let mut mirror_guard = self.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mirror) = mirror_guard.as_mut() else {
+            return 0;
+        };
+        const PIECE: usize = 64 << 10;
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+
+        // Collect all 64 KiB-aligned pieces across the merged ranges.
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        for &(from, to) in &merged {
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
+                pieces.push((at, n));
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
+        }
+
+        // Find dirty pieces in parallel using a persistent worker pool (zero
+        // per-submission OS thread creation overhead).
+        let dirty: Vec<(usize, usize)> = if pieces.len() >= 16 {
+            scan_dirty_parallel(self.data, mirror, &pieces)
+        } else {
+            pieces
+                .into_iter()
+                .filter(|&(at, n)| {
+                    // SAFETY: inside the mapping.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+                    host != &mirror[at..at + n]
+                })
+                .collect()
+        };
+
+        if dirty.is_empty() {
+            return 0;
+        }
+
+        let mut written = 0;
+        let mut title = vec![0u8; PIECE];
+        let mut synced = Vec::with_capacity(dirty.len());
+        for (at, n) in dirty {
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            let old = &mut mirror[at..at + n];
+            let title = &mut title[..n];
+            if crate::host::read_into((start + at) as *const u8, title) {
+                let mut changed = false;
+                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter_mut()) {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        changed = true;
+                    }
+                    *h = *t;
+                    *o = *t;
                 }
+                if changed {
+                    crate::watch::writing(start + at, n);
+                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    written += n;
+                }
+                synced.push((start + at) / PAGE);
+            } else {
+                // Keep mirror synced even on unmapped holes.
+                old.copy_from_slice(host);
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+
+        if !synced.is_empty() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+            // Query GetWriteWatch only on contiguous runs of dirty synced pages
+            // instead of the entire merged buffer span (often 174 MB).
+            synced.sort_unstable();
+            synced.dedup();
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut i = 0;
+            while i < synced.len() {
+                let first = synced[i];
+                let mut last = first + 1;
+                i += 1;
+                while i < synced.len() && synced[i] <= last + 4 {
+                    last = synced[i] + 1;
+                    i += 1;
+                }
+                if let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true) {
+                    for &page in synced.iter().filter(|&&p| (first..last).contains(&p)) {
+                        if let Some(slot) = copied.get_mut(page - base) {
+                            *slot = now;
+                        }
+                    }
+                }
+            }
         }
         written
     }
@@ -354,14 +363,27 @@ impl Shadow {
         bytes
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy
+    /// (and keeps the persistent mirror in sync if initialized).
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        let offset = from - start;
+        let len = to - from;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        to - from
+        let at = unsafe { self.data.add(offset) };
+        crate::host::copy_mapped(at, from as *const u8, len, false);
+        if let Some(mirror) = self
+            .mirror
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            // SAFETY: `at..at+len` is inside `self.data` and just written above.
+            let updated = unsafe { std::slice::from_raw_parts(at, len) };
+            mirror[offset..offset + len].copy_from_slice(updated);
+        }
+        len
     }
 }
 
@@ -496,4 +518,136 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Persistent worker pool for parallel dirty-chunk scanning in `copy_back_pending`.
+struct ScanJob {
+    epoch: u64,
+    data: usize,
+    mirror: usize,
+    pieces_ptr: usize,
+    pieces_len: usize,
+    results_ptr: usize,
+    done: usize,
+}
+
+struct ScanPool {
+    workers: usize,
+    state: Mutex<ScanJob>,
+    cv_work: std::sync::Condvar,
+    cv_done: std::sync::Condvar,
+}
+
+fn scan_pool() -> &'static ScanPool {
+    static POOL: std::sync::OnceLock<&'static ScanPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        let pool: &'static ScanPool = Box::leak(Box::new(ScanPool {
+            workers,
+            state: Mutex::new(ScanJob {
+                epoch: 0,
+                data: 0,
+                mirror: 0,
+                pieces_ptr: 0,
+                pieces_len: 0,
+                results_ptr: 0,
+                done: 0,
+            }),
+            cv_work: std::sync::Condvar::new(),
+            cv_done: std::sync::Condvar::new(),
+        }));
+        for id in 0..workers {
+            std::thread::Builder::new()
+                .name(format!("victory-scan-{id}"))
+                .spawn(move || {
+                    let mut seen_epoch = 0u64;
+                    loop {
+                        let (data, mirror, pieces_ptr, pieces_len, results_ptr, epoch) = {
+                            let mut st = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while st.epoch == seen_epoch {
+                                st = pool.cv_work.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            (
+                                st.data,
+                                st.mirror,
+                                st.pieces_ptr,
+                                st.pieces_len,
+                                st.results_ptr,
+                                st.epoch,
+                            )
+                        };
+                        seen_epoch = epoch;
+                        let chunk = pieces_len.div_ceil(pool.workers);
+                        let lo = (id * chunk).min(pieces_len);
+                        let hi = ((id + 1) * chunk).min(pieces_len);
+                        let mut local = Vec::new();
+                        if lo < hi {
+                            // SAFETY: caller blocks on `cv_done` until all workers finish,
+                            // keeping `data`, `mirror`, `pieces`, and `results[id]` alive.
+                            let pieces = unsafe {
+                                std::slice::from_raw_parts(
+                                    pieces_ptr as *const (usize, usize),
+                                    pieces_len,
+                                )
+                            };
+                            let data_ptr = data as *const u8;
+                            let mirror_ptr = mirror as *const u8;
+                            for &(at, n) in &pieces[lo..hi] {
+                                // SAFETY: within mapped host buffer.
+                                let host =
+                                    unsafe { std::slice::from_raw_parts(data_ptr.add(at), n) };
+                                // SAFETY: within mirror Vec of identical length.
+                                let old =
+                                    unsafe { std::slice::from_raw_parts(mirror_ptr.add(at), n) };
+                                if host != old {
+                                    local.push((at, n));
+                                }
+                            }
+                            // SAFETY: each worker owns its exclusive slot `results[id]`.
+                            unsafe {
+                                *(results_ptr as *mut Vec<(usize, usize)>).add(id) = local;
+                            }
+                        }
+                        let mut st = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.done += 1;
+                        if st.done == pool.workers {
+                            pool.cv_done.notify_one();
+                        }
+                    }
+                })
+                .expect("spawn victory-scan worker");
+        }
+        pool
+    })
+}
+
+fn scan_dirty_parallel(
+    data: *const u8,
+    mirror: &[u8],
+    pieces: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let pool = scan_pool();
+    let mut results: Vec<Vec<(usize, usize)>> = vec![Vec::new(); pool.workers];
+    {
+        let mut st = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.data = data as usize;
+        st.mirror = mirror.as_ptr() as usize;
+        st.pieces_ptr = pieces.as_ptr() as usize;
+        st.pieces_len = pieces.len();
+        st.results_ptr = results.as_mut_ptr() as usize;
+        st.done = 0;
+        st.epoch = st.epoch.wrapping_add(1);
+        pool.cv_work.notify_all();
+        while st.done < pool.workers {
+            st = pool.cv_done.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let total: usize = results.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for r in results {
+        out.extend(r);
+    }
+    out
 }

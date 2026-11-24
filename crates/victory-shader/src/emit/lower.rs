@@ -925,6 +925,26 @@ impl<'a> Lower<'a> {
             .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
     }
 
+    /// Whether pixel export `(b, i)` is followed in the same block by a `done`
+    /// export under the exact same EXEC guard, so that later export discards
+    /// the lanes masked off here (e.g. a multi-MRT export sequence after a
+    /// pixel kill).
+    fn same_guard_done_export(&self, b: usize, i: usize) -> bool {
+        let want = self.x.st.guards[b][i];
+        let Some(done_at) = ((i + 1)..self.x.p.blocks[b].insts.len())
+            .find(|&j| self.exports.get(&(b, j)).is_some_and(|e| e.done))
+        else {
+            return false;
+        };
+        if self.x.st.guards[b][done_at] != want {
+            return false;
+        }
+        let done_exp = self.exports[&(b, done_at)];
+        !matches!(done_exp.target, Target::Null)
+            && ((i + 1)..done_at)
+                .all(|j| !self.exports.contains_key(&(b, j)) || self.x.st.guards[b][j] == want)
+    }
+
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
         let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
@@ -6496,13 +6516,17 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard
             && !mesh
         {
-            if !(e.done && self.s.pixel) {
+            if !self.s.pixel {
                 return Err("a conditional export");
             }
-            let t = self.s.m.bool(true);
-            let kill = self.s.m.bin(c, Bin::Xor, g, t);
-            self.s
-                .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            if e.done {
+                let t = self.s.m.bool(true);
+                let kill = self.s.m.bin(c, Bin::Xor, g, t);
+                self.s
+                    .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+            } else if !self.same_guard_done_export(b, i) {
+                return Err("a conditional export");
+            }
         }
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);

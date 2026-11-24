@@ -746,4 +746,106 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// Multi-MRT pixel shader exports sharing one EXEC kill guard: the earlier
+    /// non-`done` export is accepted when the block's `done` export carries
+    /// the same guard (and therefore discards the inactive lanes), while a
+    /// non-`done` export under a different guard is still refused.
+    #[test]
+    fn guarded_multi_mrt_pixel_exports_follow_done_kill_guard() {
+        let emit_ps = |words: &[u32]| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 1 << 8, // POS_X_FLOAT in v0
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let pos = SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 1,
+                half: false,
+            };
+            let mrt = |index| SigElement {
+                name: "SV_Target".into(),
+                index,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(index),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let isg1 = super::container::signature(&[pos], true);
+            let osg1 = super::container::signature(&[mrt(0), mrt(1)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        // Both mrt0 (done=false) and mrt1 (done=true, vm=true) share the EXEC
+        // kill mask from v_cmpx_gt_f32.
+        let shared = emit_ps(&[
+            0x7D28_0080, // v_cmpx_gt_f32 exec_lo, 0, v0
+            0xF800_000F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0
+            0xF800_181F,
+            0x0000_0000, // exp mrt1, v0, v0, v0, v0 done vm
+            0xBF81_0000, // s_endpgm
+        ])
+        .expect("multi-MRT exports with shared kill guard emit");
+
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shared.dxil.clone()).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let vs = super::host::stub_vs(&shared).unwrap();
+            host.pipeline(&vs, &shared).unwrap();
+        }
+
+        // Restoring EXEC between mrt0 and mrt1 means mrt0's guard differs from
+        // the done export's (unguarded), so it must still be refused.
+        let mismatched = emit_ps(&[
+            0xBE80_037E, // s_mov_b32 s0, exec_lo
+            0x7D28_0080, // v_cmpx_gt_f32 exec_lo, 0, v0
+            0xF800_000F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xF800_181F,
+            0x0000_0000, // exp mrt1, v0, v0, v0, v0 done vm
+            0xBF81_0000, // s_endpgm
+        ]);
+        assert!(matches!(
+            mismatched,
+            Err(crate::ShaderError::Unsupported {
+                what: "a conditional export",
+                ..
+            })
+        ));
+    }
 }

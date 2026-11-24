@@ -180,6 +180,18 @@ impl NativeProgram {
         }
         code
     }
+
+    /// Whether a compute program's root arguments all sit past the 16 user
+    /// SGPRs and arrive through the spill table `s[0:1]` points to.
+    pub fn has_spill_table(&self) -> bool {
+        self.stage == HwStage::Cs
+            && self.layout.iter().any(|r| r.sgprs > 0)
+            && self
+                .layout
+                .iter()
+                .filter(|r| r.sgprs > 0)
+                .all(|r| self.stage.user_sgpr(r.user_data) >= 16)
+    }
 }
 
 /// What a semantic is, as the stage data names it.

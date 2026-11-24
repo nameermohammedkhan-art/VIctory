@@ -15,8 +15,10 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
+use std::collections::HashMap;
+
 use crate::ShaderError;
-use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
+use crate::gfx10::{self, Fields, Flow, Instruction, NULL, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC.
@@ -116,6 +118,228 @@ impl Inst {
     /// The value this instruction writes to `reg`.
     pub fn write(&self, reg: Reg) -> Option<Value> {
         self.writes.iter().find(|w| w.0 == reg).map(|w| w.1)
+    }
+}
+
+/// Decodes `native`'s patched code, builds its SSA form, and rewrites compute
+/// spill-table loads into virtual user-SGPR inputs when the layout spills past
+/// the 16 hardware user SGPRs.
+pub fn build_program(native: &crate::native::NativeProgram) -> Result<Program, ShaderError> {
+    let mut p = build(&native.patched_code(), native.wave64, native.vgprs)?;
+    if native.has_spill_table() {
+        rewrite_spill_table(&mut p);
+    }
+    Ok(p)
+}
+
+/// First user SGPR represented by a compute program's root-argument spill table.
+const SPILL_FIRST: u8 = 16;
+
+/// Rewrites scalar loads from a compute program's root-argument spill table
+/// (`s[0:1]`, high dword optionally masked to a 40-bit address) into SSA reads
+/// of the virtual user-data SGPRs `s16+` (`table dword k` -> `Reg::S(16 + k)`).
+///
+/// Running on SSA form preserves the entry arguments even when the program
+/// later overwrites `s16+`, tracks the spill pointer across branches and joins,
+/// and needs no spare SGPR range.
+pub fn rewrite_spill_table(p: &mut Program) {
+    let Some(s0_in) = p.inputs.iter().find(|i| i.0 == Reg::S(0)).map(|i| i.1) else {
+        return;
+    };
+    let Some(s1_in) = p.inputs.iter().find(|i| i.0 == Reg::S(1)).map(|i| i.1) else {
+        return;
+    };
+
+    let mut next_val = p
+        .inputs
+        .iter()
+        .map(|i| i.1.0)
+        .chain(p.blocks.iter().flat_map(|b| {
+            b.phis
+                .iter()
+                .map(|phi| phi.value.0)
+                .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1.0)))
+        }))
+        .max()
+        .map_or(0, |m| m + 1);
+
+    // Optimistic SSA lattice: None = unvisited, Some(0) = not spill ptr,
+    // Some(1) = s0 (lo), Some(2) = s1 masked to <= 16 high bits (hi).
+    let mut tag: Vec<Option<u8>> = vec![None; next_val as usize];
+    for &(_, v) in &p.inputs {
+        tag[v.0 as usize] = Some(0);
+    }
+    tag[s0_in.0 as usize] = Some(1);
+    tag[s1_in.0 as usize] = Some(2);
+
+    let order = reverse_postorder(&p.blocks);
+    for _ in 0..64 {
+        let mut changed = false;
+        for &b in &order {
+            let block = &p.blocks[b];
+            for phi in &block.phis {
+                let mut agreed: Option<u8> = None;
+                for &arg in &phi.args {
+                    if arg == phi.value {
+                        continue;
+                    }
+                    if let Some(t) = tag[arg.0 as usize] {
+                        agreed = match agreed {
+                            None => Some(t),
+                            Some(prev) if prev == t => Some(t),
+                            Some(_) => Some(0),
+                        };
+                    }
+                }
+                if agreed.is_some() && agreed != tag[phi.value.0 as usize] {
+                    tag[phi.value.0 as usize] = agreed;
+                    changed = true;
+                }
+            }
+            for inst in &block.insts {
+                let derived = match (inst.name(), &inst.fields) {
+                    (
+                        "s_mov_b32",
+                        Fields::Sop {
+                            dst: Some(Operand::Scalar { dwords: 1, .. }),
+                            src,
+                            ..
+                        },
+                    ) => match src.as_slice() {
+                        [Operand::Scalar { code, .. }] if *code < 106 => {
+                            inst.read(Reg::S(*code)).and_then(|v| tag[v.0 as usize])
+                        }
+                        _ => Some(0),
+                    },
+                    (
+                        "s_and_b32",
+                        Fields::Sop {
+                            dst: Some(Operand::Scalar { dwords: 1, .. }),
+                            src,
+                            ..
+                        },
+                    ) => match src.as_slice() {
+                        [x, y] => {
+                            let is_masked_hi = |reg: &Operand, mask: &Operand| match (reg, mask) {
+                                (Operand::Scalar { code, .. }, Operand::Literal(m))
+                                    if *code < 106 && *m <= 0xFFFF =>
+                                {
+                                    inst.read(Reg::S(*code))
+                                        .is_some_and(|v| tag[v.0 as usize] == Some(2))
+                                }
+                                (Operand::Scalar { code, .. }, Operand::Const(c))
+                                    if *code < 106 && (128..=192).contains(c) =>
+                                {
+                                    inst.read(Reg::S(*code))
+                                        .is_some_and(|v| tag[v.0 as usize] == Some(2))
+                                }
+                                _ => false,
+                            };
+                            if is_masked_hi(x, y) || is_masked_hi(y, x) {
+                                Some(2)
+                            } else {
+                                Some(0)
+                            }
+                        }
+                        _ => Some(0),
+                    },
+                    _ => Some(0),
+                };
+                for &(reg, v) in &inst.writes {
+                    let new = if matches!(reg, Reg::S(c) if c < 106) {
+                        derived
+                    } else {
+                        Some(0)
+                    };
+                    if new.is_some() && new != tag[v.0 as usize] {
+                        tag[v.0 as usize] = new;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Rewrite spill-table s_load_dword* instructions into virtual Reg::S(16+k) inputs.
+    let mut replace: HashMap<Value, Value> = HashMap::new();
+    let mut spill_inputs: HashMap<u8, Value> = HashMap::new();
+    let mut alloc_input = |p_inputs: &mut Vec<(Reg, Value)>, sgpr: u8| -> Value {
+        *spill_inputs.entry(sgpr).or_insert_with(|| {
+            let v = Value(next_val);
+            next_val += 1;
+            // Insert ahead of any prior uninitialized entry for this virtual
+            // SGPR so lookups by Reg::S(sgpr) resolve to the spill-table input.
+            p_inputs.insert(0, (Reg::S(sgpr), v));
+            v
+        })
+    };
+
+    for block in &mut p.blocks {
+        block.insts.retain(|inst| {
+            let Fields::Smem {
+                data: Some(Operand::Scalar { code: dst, dwords }),
+                base:
+                    Operand::Scalar {
+                        code: base,
+                        dwords: 2,
+                    },
+                offset,
+                soffset: Operand::Scalar { code: NULL, .. },
+                ..
+            } = inst.fields
+            else {
+                return true;
+            };
+            if !inst.name().starts_with("s_load_dword") || offset < 0 || offset % 4 != 0 {
+                return true;
+            }
+            let lo_ok = inst
+                .read(Reg::S(base))
+                .is_some_and(|v| tag[v.0 as usize] == Some(1));
+            let hi_ok = inst
+                .read(Reg::S(base + 1))
+                .is_some_and(|v| tag[v.0 as usize] == Some(2));
+            if !lo_ok || !hi_ok {
+                return true;
+            }
+            let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
+            let n = dwords.max(1);
+            if first + u32::from(n) > 106 {
+                return true;
+            }
+            for k in 0..n {
+                if let Some(orig) = inst.write(Reg::S(dst + k)) {
+                    let sgpr = (first + u32::from(k)) as u8;
+                    let v_in = alloc_input(&mut p.inputs, sgpr);
+                    replace.insert(orig, v_in);
+                }
+            }
+            false
+        });
+    }
+
+    if replace.is_empty() {
+        return;
+    }
+
+    for block in &mut p.blocks {
+        for phi in &mut block.phis {
+            for arg in &mut phi.args {
+                if let Some(&new) = replace.get(arg) {
+                    *arg = new;
+                }
+            }
+        }
+        for inst in &mut block.insts {
+            for (_, v) in &mut inst.reads {
+                if let Some(&new) = replace.get(v) {
+                    *v = new;
+                }
+            }
+        }
     }
 }
 
@@ -1223,5 +1447,99 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn spill_table_rewrites_after_branches_and_preserves_entry_overwrites() {
+        // Early exit branch, then mask s1 in place, then load 16 dwords from
+        // spill offset 0x10 into s[0:15] (overwriting s0/s1), then read s2
+        // (table dword 6 -> s22) in s_mov_b32 s20, s2.
+        let code: Vec<u8> = [
+            0xBF88_0001u32, // 0x00: s_cbranch_execz +1 -> 0x08 (endpgm)
+            0xBF82_0001,    // 0x04: s_branch +1 -> 0x0c
+            S_ENDPGM,       // 0x08: s_endpgm
+            0x8701_FF01,    // 0x0c: s_and_b32 s1, s1, lit(0xff)
+            0x0000_00FF,
+            0xF410_0000, // 0x14: s_load_dwordx16 s[0:15], s[0:1], 0x10
+            0xFA00_0010,
+            0xBE94_0302, // 0x1c: s_mov_b32 s20, s2
+            S_ENDPGM,    // 0x20: s_endpgm
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut p = build(&code, false, 4).unwrap();
+        rewrite_spill_table(&mut p);
+        assert!(
+            !p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name().starts_with("s_load_")),
+            "spill load after branch was rewritten"
+        );
+        // s2 came from offset 0x10 (user_data 20) + 2 = s22.
+        let mov = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_mov_b32")
+            .unwrap();
+        let s22 = input(&p, Reg::S(22));
+        assert_eq!(mov.read(Reg::S(2)), Some(s22));
+    }
+
+    #[test]
+    fn spill_table_second_load_after_clobbering_s16_still_reads_entry() {
+        // First load overwrites s[16:19] with table dwords 4..7 (s20..s23);
+        // second load reads table dwords 0..1 (s16..s17) into s[4:5].
+        // SSA must bind s4 to entry s16, not to the overwritten s16.
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,    // s_and_b32 s3, s1, 0xff
+            0x0000_00FF,
+            0xF408_0401, // s_load_dwordx4 s[16:19], s[2:3], 0x10
+            0xFA00_0010,
+            0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0x00
+            0xFA00_0000,
+            0xBE86_0304, // s_mov_b32 s6, s4
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut p = build(&code, false, 4).unwrap();
+        rewrite_spill_table(&mut p);
+        let mov = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_mov_b32" && i.write(Reg::S(6)).is_some())
+            .unwrap();
+        assert_eq!(mov.read(Reg::S(4)), Some(input(&p, Reg::S(16))));
+        assert_ne!(input(&p, Reg::S(16)), input(&p, Reg::S(20)));
+    }
+
+    #[test]
+    fn spill_table_leaves_non_spill_loads_untouched() {
+        let code: Vec<u8> = [
+            0xBE82_0380u32, // s_mov_b32 s2, 0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0xF408_0201,    // s_load_dwordx4 s[8:11], s[2:3], 0
+            0xFA00_0000,
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let mut p = build(&code, false, 4).unwrap();
+        rewrite_spill_table(&mut p);
+        assert_eq!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name().starts_with("s_load_"))
+                .count(),
+            1
+        );
     }
 }

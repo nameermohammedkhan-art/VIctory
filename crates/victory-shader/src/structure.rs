@@ -228,31 +228,124 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
-    }
-
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
+        let mut unsat = HashSet::new();
+        if !self.meet_in(all.to_vec(), &mut budget, &mut unsat) {
             return false;
         }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
-            return true;
-        }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
-            let next = all
+        // If the full search hit its budget, an unsatisfiable subset still
+        // proves the full conjunction impossible: peel off the earliest-variable
+        // condition(s) (typically a wide `reach` BDD) and retry.
+        if budget == 0 && all.len() > 2 {
+            let mut sub: Vec<(Bool, bool)> = all
                 .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
+                .copied()
+                .filter(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE)
                 .collect();
-            self.meet_in(next, budget)
-        })
+            sub.sort_unstable();
+            sub.dedup();
+            while sub.len() > 1 {
+                let min_v = sub
+                    .iter()
+                    .map(|&(b, _)| self.nodes[b.0 as usize].0)
+                    .min()
+                    .expect("len > 1");
+                let before = sub.len();
+                sub.retain(|&(b, _)| self.nodes[b.0 as usize].0 != min_v);
+                if sub.len() == before || sub.len() < 2 {
+                    break;
+                }
+                let mut sub_budget = MAX_MEET / 4;
+                let mut sub_unsat = HashSet::new();
+                if !self.meet_in(sub.clone(), &mut sub_budget, &mut sub_unsat) {
+                    return false;
+                }
+                if sub_budget > 0 {
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        unsat: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
+        loop {
+            let fails =
+                |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+            if all.iter().any(fails) {
+                return false;
+            }
+            all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+            all.sort_unstable();
+            all.dedup();
+            // `(b, false)` and `(b, true)` are adjacent after sort.
+            if all.windows(2).any(|w| w[0].0 == w[1].0) {
+                return false;
+            }
+            // In a reduced OBDD, every non-terminal node reaches both TRUE and FALSE.
+            if all.len() <= 1 {
+                return true;
+            }
+            if unsat.contains(&all) {
+                return false;
+            }
+            if *budget == 0 {
+                return true;
+            }
+            *budget -= 1;
+            let top = |b: Bool| self.nodes[b.0 as usize].0;
+            let v = all.iter().map(|&(b, _)| top(b)).min().expect("len >= 2");
+            // When only one BDD in `all` depends on `v`, `v` can be chosen
+            // independently for it: drop it if either cofactor satisfies it,
+            // or force the only non-failing cofactor without branching.
+            let mut owner = None;
+            let mut multi = false;
+            for (i, &(b, _)) in all.iter().enumerate() {
+                if top(b) == v {
+                    if owner.is_some() {
+                        multi = true;
+                        break;
+                    }
+                    owner = Some(i);
+                }
+            }
+            if !multi && let Some(idx) = owner {
+                let (b, holds) = all[idx];
+                let (lo, hi) = self.split(b, v);
+                let ok = if holds { Bool::TRUE } else { Bool::FALSE };
+                let bad = if holds { Bool::FALSE } else { Bool::TRUE };
+                if lo == ok || hi == ok {
+                    all.remove(idx);
+                    continue;
+                }
+                if lo == bad {
+                    all[idx] = (hi, holds);
+                    continue;
+                }
+                if hi == bad {
+                    all[idx] = (lo, holds);
+                    continue;
+                }
+            }
+            let sat = [false, true].into_iter().any(|value| {
+                let next = all
+                    .iter()
+                    .map(|&(b, holds)| {
+                        let (lo, hi) = self.split(b, v);
+                        (if value { hi } else { lo }, holds)
+                    })
+                    .collect();
+                self.meet_in(next, budget, unsat)
+            });
+            if !sat {
+                unsat.insert(all);
+            }
+            return sat;
+        }
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1230,5 +1323,64 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn meet_proves_unsat_behind_deep_reach_dag() {
+        // A wide reach condition over 24 independent XOR pairs (2^24 truth
+        // assignments, compact linear BDD) paired with a late contradiction
+        // `(c, true) && (c, false)` and a derived `(c ^ d) && c && d`.
+        // Without canonicalisation and UNSAT memoisation, backtracking over
+        // the 24 leading variables exhausts `MAX_MEET` and returns `true`.
+        let mut b = Bools::new();
+        let mut reach = Bool::TRUE;
+        for k in 0..24u32 {
+            let x = b.atom(Atom::Lane(Value(2 * k)), 0);
+            let y = b.atom(Atom::Lane(Value(2 * k + 1)), 0);
+            let xor = b.xor(x, y);
+            reach = b.and(reach, xor);
+        }
+        let c = b.atom(Atom::Lane(Value(100)), 1);
+        let d = b.atom(Atom::Lane(Value(101)), 1);
+        let c_xor_d = b.xor(c, d);
+        let c_and_d = b.and(c, d);
+        let not_c_or_not_d = b.not(c_and_d);
+
+        // Direct contradiction behind the deep DAG.
+        assert!(!b.meet(&[(reach, true), (c, true), (c, false)]));
+        // Non-trivial late contradiction: (c ^ d) & c & d is UNSAT.
+        assert!(!b.meet(&[(reach, true), (c_xor_d, true), (c, true), (d, true)]));
+        // Equivalent negated form: !(c & d) & c & d is UNSAT.
+        assert!(!b.meet(&[(reach, true), (not_c_or_not_d, true), (c, true), (d, true)]));
+        // Nearby satisfiable cases must stay satisfiable.
+        assert!(b.meet(&[(reach, true), (c_xor_d, true), (c, true), (d, false)]));
+        assert!(b.meet(&[(reach, true), (not_c_or_not_d, true), (c, true), (d, false)]));
+        // Single non-terminal BDD is always satisfiable both ways.
+        assert!(b.meet(&[(reach, true)]));
+        assert!(b.meet(&[(reach, false)]));
+    }
+
+    #[test]
+    fn meet_memoizes_shared_unsat_subproblems() {
+        // Build a parity chain of 20 variables: `(x0 ^ ... ^ x19) && !(x0 ^ ... ^ x19)`
+        // split across two differently-structured BDDs so direct pair contradiction
+        // does not fire, forcing DAG traversal that would take 2^20 steps without
+        // UNSAT memoisation.
+        let mut b = Bools::new();
+        let mut parity = Bool::FALSE;
+        let mut rest = Bool::FALSE;
+        for k in 0..20u32 {
+            let x = b.atom(Atom::Lane(Value(k)), 0);
+            parity = b.xor(parity, x);
+            if k > 0 {
+                rest = b.xor(rest, x);
+            }
+        }
+        let x0 = b.atom(Atom::Lane(Value(0)), 0);
+        // `parity == (x0 ^ rest)`: forcing `x0 = false`, `parity = true`, `rest = false`
+        // is UNSAT across all 2^19 assignments to x1..x19.
+        assert!(!b.meet(&[(parity, true), (rest, false), (x0, false)]));
+        // Flipping `x0 = true` makes it SAT.
+        assert!(b.meet(&[(parity, true), (rest, false), (x0, true)]));
     }
 }

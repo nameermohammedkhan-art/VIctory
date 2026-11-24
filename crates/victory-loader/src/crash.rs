@@ -173,9 +173,7 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
                     context.Rip += pass.len as u64;
                     return true;
                 }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
+                if let Some(len) = clwb_len(&bytes[..n]) {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -193,13 +191,17 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
-/// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+/// Ice Lake lack: its length, or `None` for any other instruction or a slice
+/// shorter than the full encoding.
+fn clwb_len(code: &[u8]) -> Option<usize> {
+    if *code.first()? != 0x66 {
         return None;
     }
-    let modrm = code[at + 2];
+    let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
+    if code.get(at..at + 2)? != [0x0f, 0xae] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || (modrm >> 3) & 7 != 6 {
         return None;
@@ -207,7 +209,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     let mut len = at + 3;
     let mut base = rm;
     if rm == 4 {
-        base = code[len] & 7;
+        base = *code.get(len)? & 7;
         len += 1;
     }
     len += match mode {
@@ -216,7 +218,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
         2 => 4,
         _ => 0,
     };
-    Some(len)
+    (len <= code.len()).then_some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -751,26 +753,15 @@ mod tests {
 
     #[test]
     fn clwb_lengths() {
-        let pad = |b: &[u8]| {
-            let mut c = [0u8; 15];
-            c[..b.len()].copy_from_slice(b);
-            c
-        };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
-            Some(8)
-        ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
-            Some(8)
-        ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]), Some(8)); // [rax+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]), Some(8)); // [rip+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
+        assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form
     }
 
     #[test]
@@ -985,6 +976,76 @@ mod tests {
             let end = page.add(0x1000 - 3);
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clwb_len_decodes_exact_slices_and_rejects_truncation() {
+        // clwb [rcx], clwb [r9], clwb [rsp], clwb [rax + disp8]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x31]), Some(4));
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5));
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5));
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5));
+        // clwb [rip + disp32], clwb [disp32] via SIB base 5, clwb [r8 + r9*4 + disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]), Some(8));
+        assert_eq!(
+            clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x25, 0, 0, 0, 0]),
+            Some(9)
+        );
+        assert_eq!(
+            clwb_len(&[0x66, 0x43, 0x0f, 0xae, 0xb4, 0x88, 0, 0, 0, 0]),
+            Some(10)
+        );
+        // Truncated encodings and non-clwb opcodes must not match.
+        assert_eq!(clwb_len(&[]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70]), None); // missing disp8
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34]), None); // missing SIB
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0]), None); // missing 1 byte of disp32
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // mod == 3
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // /7 (clflushopt)
+    }
+
+    #[test]
+    fn emulated_clwb_at_end_of_page_does_not_read_past_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let encodings: &[&[u8]] = &[
+            &[0x66, 0x0f, 0xae, 0x31],                               // 4 bytes -> offset 0xffc
+            &[0x66, 0x41, 0x0f, 0xae, 0x31],                         // 5 bytes -> offset 0xffb
+            &[0x66, 0x43, 0x0f, 0xae, 0xb4, 0x88, 1, 2, 3, 4],       // 10 bytes -> offset 0xff6
+        ];
+        // SAFETY: two pages owned by the test, the second made unreadable so
+        // any read past the page boundary faults.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            let guard = page.add(0x1000).cast();
+            assert_ne!(VirtualProtect(guard, 0x1000, PAGE_NOACCESS, &mut old), 0);
+            for insn in encodings {
+                let start = page.add(0x1000 - insn.len());
+                start.copy_from_nonoverlapping(insn.as_ptr(), insn.len());
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start as u64;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                assert!(emulate_amd_only(&mut pointers));
+                assert_eq!(context.Rip, start as u64 + insn.len() as u64);
+            }
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }

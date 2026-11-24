@@ -35,7 +35,8 @@
 //!             mask, u8 attribute (v_interp `attr`), u8 default, u8 second
 //!             row (of a packed pair), u8 parameter slot, u8 flags (bit 0
 //!             flat, 1 linear, 3 fp16, 4 fp16 packed); E+0x124 u32 count
-//!     E+0x134 u32 SPI_PS_INPUT_ADDR, E+0x138 u32 DB_SHADER_CONTROL
+//!     E+0x128 u32 SPI_SHADER_PGM_RSRC2_PS, E+0x134 u32 SPI_PS_INPUT_ADDR,
+//!             E+0x138 u32 DB_SHADER_CONTROL
 //!     E+0x148 u32 export patch size (dwords), E+0x14c 8 patches, one per
 //!             MRT: u32 code offset (dwords, -1 none), then the export code
 //!             for each color format in 10 slots of 10 dwords (ZERO, 32_R,
@@ -102,6 +103,7 @@ const ENTRY_SIZE: u64 = 20;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
+const PS_RSRC2: usize = 0x128;
 const PS_INPUT_ADDR: usize = 0x134;
 const PS_DB_SHADER_CONTROL: usize = 0x138;
 const PS_PATCH_SIZE: usize = 0x148;
@@ -260,6 +262,8 @@ pub enum StageIo {
     },
     Ps {
         inputs: Vec<PsInput>,
+        /// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs and enabled system SGPRs.
+        rsrc2: u32,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
         /// `DB_SHADER_CONTROL`: depth export, kill.
@@ -268,6 +272,33 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+}
+
+impl StageIo {
+    /// How many SGPRs the hardware initializes on wave entry for stages whose
+    /// `PGM_RSRC2` register is parsed. General SGPRs at or above this count
+    /// hold whatever the previous wave left.
+    pub fn initialized_sgprs(&self) -> Option<u8> {
+        match self {
+            StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { rsrc2, .. } => Some(ps_initialized_sgprs(*rsrc2)),
+            _ => None,
+        }
+    }
+}
+
+/// SGPRs the hardware initializes for a pixel shader from
+/// `SPI_SHADER_PGM_RSRC2_PS`: user SGPRs (bits 1-5, MSB bit 28), `PRIM_MASK`
+/// (always 1), and optional system SGPRs (`SCRATCH_EN` bit 0, `WAVE_CNT_EN`
+/// bit 7, `LOAD_COLLISION_WAVEID` bit 25, `LOAD_INTRAWAVE_COLLISION` bit 26).
+pub fn ps_initialized_sgprs(rsrc2: u32) -> u8 {
+    let user = ((rsrc2 >> 1) & 0x1F) | ((rsrc2 >> 28 & 1) << 5);
+    let system = 1
+        + (rsrc2 & 1)
+        + (rsrc2 >> 7 & 1)
+        + (rsrc2 >> 25 & 1)
+        + (rsrc2 >> 26 & 1);
+    (user + system).min(106) as u8
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -605,6 +636,7 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     }
     Ok(StageIo::Ps {
         inputs,
+        rsrc2: u32_at(data, PS_RSRC2)?,
         input_addr: u32_at(data, PS_INPUT_ADDR)?,
         db_shader_control: u32_at(data, PS_DB_SHADER_CONTROL)?,
         patches,
@@ -785,6 +817,7 @@ mod tests {
                     used: vec![],
                     io: StageIo::Ps {
                         inputs: vec![],
+                        rsrc2: 0,
                         input_addr: 0,
                         db_shader_control: 0,
                         patches: vec![],
@@ -977,6 +1010,18 @@ mod tests {
             threads: [8, 8, 1],
         };
         assert_eq!(cs.initialized_sgprs(), 11);
+    }
+
+    #[test]
+    fn ps_initialized_sgprs_covers_user_prim_mask_and_system_bits() {
+        // 10 user SGPRs (0x14 >> 1), plus PRIM_MASK: s0..=s10 -> 11.
+        assert_eq!(ps_initialized_sgprs(0x14), 11);
+        // Same with SCRATCH_EN (bit 0) and LOAD_COLLISION_WAVEID (bit 25): 13.
+        assert_eq!(ps_initialized_sgprs(0x0200_0015), 13);
+        // Same with WAVE_CNT_EN (bit 7) and LOAD_INTRAWAVE_COLLISION (bit 26): 15.
+        assert_eq!(ps_initialized_sgprs(0x0600_0095), 15);
+        // USER_SGPR_MSB (bit 28) sets 32 user SGPRs, plus PRIM_MASK: 33.
+        assert_eq!(ps_initialized_sgprs(1 << 28), 33);
     }
 
     #[test]

@@ -1923,3 +1923,79 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 }
+
+#[cfg(test)]
+mod ps_rsrc2_tests {
+    use super::container::SigElement;
+
+    /// A pixel shader that reads an uninitialized SGPR (at or above the count
+    /// hardware loads per `SPI_SHADER_PGM_RSRC2_PS`) gets zero, while a read
+    /// of a hardware-initialized system SGPR (e.g. `PRIM_MASK`) is still
+    /// refused.
+    #[test]
+    fn pixel_uninitialized_sgpr_reads_zero_while_system_sgpr_is_refused() {
+        let run = |sgpr: u32, rsrc2: u32| {
+            // v_mov_b32 v0, s<sgpr>; exp mrt0, v0, v0, v0, v0 done vm; s_endpgm
+            let words = [
+                0x7E00_0200 | sgpr,
+                0xF800_180F,
+                0x0000_0000,
+                0xBF81_0000,
+            ];
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    rsrc2,
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = super::container::signature(&[el], false);
+            let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+        // 4 user SGPRs (rsrc2 = 4 << 1 = 8) + PRIM_MASK (s4) => 5 initialized (s0..=s4).
+        let rsrc2 = 4 << 1;
+        // s4 (PRIM_MASK) is initialized by hardware and remains refused.
+        assert!(matches!(
+            run(4, rsrc2),
+            Err(crate::ShaderError::Unsupported {
+                what: "a hardware SGPR input",
+                ..
+            })
+        ));
+        // s5 (first uninitialized SGPR) reads as zero and validates cleanly.
+        let out = run(5, rsrc2).expect("uninitialized PS SGPR should read zero");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+}

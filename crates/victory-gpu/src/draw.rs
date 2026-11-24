@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::RootConstAddr;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -136,14 +137,17 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+        .min(if srv || uav { 1 << 20 } else { 1 << 16 });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if srv || uav || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        if uav {
+            shadow.gpu_writes(list, address, len);
+        }
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -324,6 +328,23 @@ impl State {
         }
     }
 
+    /// The 64-bit title GPU virtual address carried in root constants:
+    /// either a `(dword, dword + 1)` pair (`shift == 0`) or a single aligned
+    /// dword shifted left by `shift` bits (`shift > 0`).
+    fn const_addr_value(&self, compute: bool, addr: RootConstAddr) -> Option<u64> {
+        let Some(Root::Constants(c)) = self.roots_ref(compute).get(usize::from(addr.slot)) else {
+            return None;
+        };
+        let lo = *c.get(addr.dword as usize)?;
+        let va = if addr.shift > 0 {
+            u64::from(lo) << addr.shift
+        } else {
+            let hi = *c.get(addr.dword as usize + 1)?;
+            u64::from(lo) | (u64::from(hi) << 32)
+        };
+        (va != 0).then_some(va)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -498,7 +519,7 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, srv, false) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -508,6 +529,31 @@ impl State {
                             (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
                             (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
                             (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        }
+                    }
+                }
+            }
+            for (addrs, uav) in [(&stage.const_srvs, false), (&stage.const_uavs, true)] {
+                for &(addr, param) in addrs {
+                    let Some(address) = self.const_addr_value(compute, addr) else {
+                        once!(
+                            slot = addr.slot,
+                            dword = addr.dword,
+                            shift = addr.shift,
+                            "a shader reads a root-constant address the title did not set"
+                        );
+                        continue;
+                    };
+                    let Some(gpu) = root_view(list, address, !uav, uav) else {
+                        continue;
+                    };
+                    // SAFETY: an open list; the address is in live memory.
+                    unsafe {
+                        match (compute, uav) {
+                            (false, false) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                            (false, true) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                            (true, false) => l.SetComputeRootShaderResourceView(param, gpu),
+                            (true, true) => l.SetComputeRootUnorderedAccessView(param, gpu),
                         }
                     }
                 }
@@ -579,6 +625,17 @@ impl State {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                }
+            }
+            for &(addr, _) in stage.const_srvs.iter().chain(&stage.const_uavs) {
+                if let Some(address) = self.const_addr_value(compute, addr) {
+                    let host = crate::shadow::find(address, 1)
+                        .map(|s| (s.gpu(address), s.left(address)));
+                    let _ = write!(
+                        text,
+                        " const{}+{}<<{}={address:#x} host {host:#x?}",
+                        addr.slot, addr.dword, addr.shift
+                    );
                 }
             }
         }

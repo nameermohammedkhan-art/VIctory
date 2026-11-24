@@ -29,6 +29,11 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
+//! * **Root-constant addresses** (raw buffers whose 64-bit GPU addresses
+//!   arrive inside a `RootType::Constants` parameter, either as a `(dword,
+//!   dword + 1)` pair or as one aligned dword shifted left) as root SRVs
+//!   `t<n>` / root UAVs `u<n>` in [`ROOT_CONST_ADDR_SPACE`], `n` the index
+//!   in [`HostShader::const_srvs`] / [`HostShader::const_uavs`].
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -97,7 +102,20 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, ROOT_CONST_ADDR_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+
+/// A raw buffer address carried inside a root-constant parameter: either a
+/// 64-bit `(dword, dword + 1)` pair (`shift == 0`) or a single aligned dword
+/// shifted left by `shift` bits (`shift > 0`, e.g. `8` for 256-byte alignment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RootConstAddr {
+    /// Root parameter index in the title's root signature.
+    pub slot: u8,
+    /// Starting dword within that root-constant parameter.
+    pub dword: u32,
+    /// Left-shift applied to the single dword, or `0` for a 64-bit pair.
+    pub shift: u8,
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -156,6 +174,12 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Read-only raw buffers whose addresses arrive in root constants, bound as
+    /// `t<n>` in [`ROOT_CONST_ADDR_SPACE`] in this order.
+    pub const_srvs: Vec<RootConstAddr>,
+    /// Read/write raw buffers whose addresses arrive in root constants, bound
+    /// as `u<n>` in [`ROOT_CONST_ADDR_SPACE`] in this order.
+    pub const_uavs: Vec<RootConstAddr>,
 }
 
 impl HostShader {
@@ -308,6 +332,8 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        const_srvs: l.const_srvs,
+        const_uavs: l.const_uavs,
     })
 }
 
@@ -565,6 +591,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +603,8 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -690,6 +720,276 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn root_constant_addresses_validate_and_run_on_host() {
+        use super::host::{Dispatch, Host, Root};
+        use crate::native::{RootParam, RootType};
+
+        let sop2 = |op: u32, dst: u32, s0: u32, s1: u32| {
+            (0b10 << 30) | (op << 23) | (dst << 16) | (s1 << 8) | s0
+        };
+        let smem = |op: u32, sdata: u32, sbase: u32, off: u32, soff: u32| {
+            [
+                (0x3D << 26) | (op << 18) | (sdata << 6) | (sbase >> 1),
+                (soff << 25) | (off & 0x1F_FFFF),
+            ]
+        };
+        let global =
+            |op: u32, vdst: u32, vaddr: u32, vdata: u32, saddr: u32, off: i16, glc: bool| {
+                [
+                    (0x37 << 26)
+                        | (op << 18)
+                        | (u32::from(glc) << 16)
+                        | (2 << 14)
+                        | ((off as u32) & 0xFFF),
+                    (vdst << 24) | (saddr << 16) | (vdata << 8) | vaddr,
+                ]
+            };
+        let vmov = |vdst: u32, src0: u32| (0x3F << 25) | (vdst << 17) | (0x01 << 9) | src0;
+
+        // Compute shader with one 5-dword RootType::Constants parameter (slot 0, s2..s6):
+        //   dword 0 (s2): shifted (<< 8) read-only buffer address -> const_srvs[0]
+        //   dwords 2..3 (s4..s5): 64-bit read/write UAV address -> const_uavs[0]
+        // Reads s8 from shifted SRV[0] (offset 4), reads s9 from UAV[0] (offset 0,
+        // proving SRV+UAV aliasing promotes to a single UAV), stores [s8, s9, 7] via
+        // global_store_dwordx3 at offset 4, atomically adds 10 to offset 0 (glc -> v4),
+        // atomically compares-and-swaps offset 16 (expected 5 -> 99, glc -> v5),
+        // and stores v4, v5 at offsets 20 and 24.
+        let mut words = vec![
+            // Build shifted address s[10:11] = (u64(s2) << 8) | 4
+            0xBE8A_0302,              // s_mov_b32 s10, s2
+            0xBE8B_0380,              // s_mov_b32 s11, 0
+            sop2(0x1F, 10, 10, 0x88), // s_lshl_b64 s[10:11], s[10:11], 8
+            sop2(0x10, 10, 10, 0x84), // s_or_b32 s10, s10, 4
+        ];
+        words.extend(smem(0x00, 8, 10, 0, 0x7D)); // s_load_dword s8, s[10:11], 0  (SRV[1])
+        words.extend(smem(0x00, 9, 4, 0, 0x7D)); // s_load_dword s9, s[4:5], 0      (UAV[0])
+        words.extend([
+            vmov(0, 0x80), // v0 = 0 (byte offset)
+            vmov(1, 8),    // v1 = s8
+            vmov(2, 9),    // v2 = s9
+            vmov(3, 0x87), // v3 = 7
+        ]);
+        words.extend(global(0x1F, 0, 0, 1, 4, 4, false)); // global_store_dwordx3 v0, v[1:3], s[4:5] offset:4
+        words.push(vmov(6, 0x8A)); // v6 = 10
+        words.extend(global(0x32, 4, 0, 6, 4, 0, true)); // global_atomic_add v4, v0, v6, s[4:5] glc
+        words.extend([
+            vmov(6, 0xFF),
+            99,            // v6 = 99 (new)
+            vmov(7, 0x85), // v7 = 5  (compare)
+        ]);
+        words.extend(global(0x31, 5, 0, 6, 4, 16, true)); // global_atomic_cmpswap v5, v0, v[6:7], s[4:5] offset:16 glc
+        words.extend(global(0x1C, 0, 0, 4, 4, 20, false)); // global_store_dword v0, v4, s[4:5] offset:20
+        words.extend(global(0x1C, 0, 0, 5, 4, 24, false)); // global_store_dword v0, v5, s[4:5] offset:24
+        words.push(0xBF81_0000); // s_endpgm
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 5,
+                base_register: 0,
+                user_data: 2,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+        assert_eq!(
+            shader.const_srvs,
+            vec![RootConstAddr {
+                slot: 0,
+                dword: 0,
+                shift: 8,
+            }]
+        );
+        assert_eq!(
+            shader.const_uavs,
+            vec![RootConstAddr {
+                slot: 0,
+                dword: 2,
+                shift: 0,
+            }]
+        );
+
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        // Root param 0 = user data, param 1 = const_srvs[0], param 2 = const_uavs[0].
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                        ),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: vec![111, 42, 333],
+                            },
+                        ),
+                        (2, Root::Uav(vec![30, 0, 0, 0, 5, 0, 0])),
+                    ],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], vec![40, 42, 30, 7, 99, 30, 5]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn built_const_descriptor_supports_structured_idxen_and_scalar_loads() {
+        use super::host::{Dispatch, Host, Root};
+        use crate::native::{RootParam, RootType};
+
+        let mubuf = |op: u32, vdata: u32, vaddr: u32, srsrc: u32, off: u32, idxen: bool| {
+            [
+                (0x38 << 26) | ((op & 0x7F) << 18) | (u32::from(idxen) << 13) | (off & 0xFFF),
+                (0x80 << 24) | ((srsrc >> 2) << 16) | (vdata << 8) | vaddr,
+            ]
+        };
+        let smem = |op: u32, sdata: u32, sbase: u32, off: u32, soff: u32| {
+            [
+                (0x3D << 26) | (op << 18) | (sdata << 6) | (sbase >> 1),
+                (soff << 25) | (off & 0x1F_FFFF),
+            ]
+        };
+        let vmov = |vdst: u32, src0: u32| (0x3F << 25) | (vdst << 17) | (0x01 << 9) | src0;
+
+        // Builds a 4-dword GFX10 buffer descriptor s[4:7] around a 64-bit GPU VA in
+        // RootType::Constants (s[2:3], slot 0, dword 0) with stride = 16 bytes
+        // encoded in word 1 bits 16..29 (0x0010_0000). Reads element 0 via
+        // s_buffer_load_dword, reads element 1 + offset 4 via idxen buffer_load_dword,
+        // and stores both via idxen buffer_store_dword into element 2.
+        let mut words = vec![
+            0xBE84_0302, // s_mov_b32 s4, s2
+            0x8805_FF03,
+            0x0010_0000, // s_or_b32 s5, s3, 0x100000 (stride = 16)
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+        ];
+        words.extend(smem(0x08, 8, 4, 0, 0x7D)); // s_buffer_load_dword s8, s[4:7], 0
+        words.push(vmov(0, 0x81)); // v0 = 1 (element index 1 -> byte 16)
+        words.extend(mubuf(0x0C, 1, 0, 4, 4, true)); // buffer_load_dword v1, v0, s[4:7], 0 idxen offset:4 -> byte 20
+        words.push(vmov(2, 0x82)); // v2 = 2 (element index 2 -> byte 32)
+        words.push(vmov(3, 8)); // v3 = s8
+        words.extend(mubuf(0x1C, 3, 2, 4, 0, true)); // buffer_store_dword v3, v2, s[4:7], 0 idxen offset:0 -> byte 32
+        words.extend(mubuf(0x1C, 1, 2, 4, 4, true)); // buffer_store_dword v1, v2, s[4:7], 0 idxen offset:4 -> byte 36
+        words.push(0xBF81_0000); // s_endpgm
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 2,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+        assert!(shader.const_srvs.is_empty());
+        assert_eq!(
+            shader.const_uavs,
+            vec![RootConstAddr {
+                slot: 0,
+                dword: 0,
+                shift: 0,
+            }]
+        );
+
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+        let mut initial = vec![0u32; 12];
+        initial[0] = 0xDEAD_BEEF; // byte 0
+        initial[5] = 0xCAFE_BABE; // element 1 (byte 16) + offset 4 = byte 20
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                        ),
+                        (1, Root::Uav(initial)),
+                    ],
+                    views: &[],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        assert_eq!(out[0][8], 0xDEAD_BEEF);
+        assert_eq!(out[0][9], 0xCAFE_BABE);
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

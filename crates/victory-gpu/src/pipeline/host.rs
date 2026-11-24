@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    ROOT_CBV_SPACE, ROOT_CONST_ADDR_SPACE, RootConstAddr, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -251,6 +253,10 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Root parameters of raw buffers addressed via root constants:
+    /// (console constant address location, our root parameter).
+    pub(crate) const_srvs: Vec<(RootConstAddr, u32)>,
+    pub(crate) const_uavs: Vec<(RootConstAddr, u32)>,
 }
 
 impl Stage {
@@ -339,6 +345,8 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -375,6 +383,33 @@ impl HostPipeline {
                             Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                                 ShaderRegister: u32::from(slot),
                                 RegisterSpace: ROOT_CBV_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
+            for (addrs, kind, out) in [
+                (
+                    &t.const_srvs,
+                    D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    &mut stage.const_srvs,
+                ),
+                (
+                    &t.const_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.const_uavs,
+                ),
+            ] {
+                for (idx, &addr) in addrs.iter().enumerate() {
+                    out.push((addr, params.len() as u32));
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: kind,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: idx as u32,
+                                RegisterSpace: ROOT_CONST_ADDR_SPACE,
                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                             },
                         },

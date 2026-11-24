@@ -27,6 +27,12 @@ pub type Site = (usize, usize);
 pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
+    /// Dword offset inside `param` (non-zero for addresses carried in a
+    /// `RootType::Constants` parameter).
+    pub dword: u32,
+    /// Left-shift applied to a single aligned `RootType::Constants` dword to
+    /// form a 64-bit address (e.g. `8` for 256-byte alignment), or `0`.
+    pub shift: u8,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
     pub offset: u32,
@@ -471,6 +477,12 @@ impl<'a> Tracer<'a> {
         ))
     }
 
+    fn is_const_base(&self, v: Value) -> bool {
+        self.inputs[v.0 as usize]
+            .and_then(|reg| self.param_of(reg))
+            .is_some_and(|(param, _)| self.layout[param].root == RootType::Constants)
+    }
+
     fn sum(&self, t: Term) -> Sum {
         let v = match t {
             Term::Const(c) => {
@@ -489,11 +501,15 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
+                Some((param, dword))
+                    if dword == 0 || self.layout[param].root == RootType::Constants =>
+                {
+                    Sum {
+                        base: Some(v),
+                        offset: 0,
+                        dynamic: None,
+                    }
+                }
                 _ => dynamic,
             };
         }
@@ -512,13 +528,35 @@ impl<'a> Tracer<'a> {
             return dynamic;
         };
         let (x, y) = (self.sum(a), self.sum(b));
-        if x.base.is_some() && y.base.is_some() || x.dynamic.is_some() && y.dynamic.is_some() {
+        if x.dynamic.is_some() && y.dynamic.is_some() {
             return dynamic;
         }
+        let (base, dyn_term) = match (x.base, y.base) {
+            (Some(bx), Some(by)) => {
+                // If a real pointer root parameter meets a root constant in a
+                // sum, the pointer wins and the constant is the dynamic offset.
+                if !self.is_const_base(bx)
+                    && self.is_const_base(by)
+                    && x.dynamic.is_none()
+                    && y.dynamic.is_none()
+                {
+                    (Some(bx), Some(by))
+                } else if self.is_const_base(bx)
+                    && !self.is_const_base(by)
+                    && x.dynamic.is_none()
+                    && y.dynamic.is_none()
+                {
+                    (Some(by), Some(bx))
+                } else {
+                    return dynamic;
+                }
+            }
+            (bx, by) => (bx.or(by), x.dynamic.or(y.dynamic)),
+        };
         Sum {
-            base: x.base.or(y.base),
+            base,
             offset: x.offset.wrapping_add(y.offset),
-            dynamic: x.dynamic.or(y.dynamic),
+            dynamic: dyn_term,
         }
     }
 
@@ -600,8 +638,13 @@ impl<'a> Tracer<'a> {
                 };
                 let v = inst.read(Reg::V(reg)).ok_or("a global address")?;
                 let mut extra = self.sum(self.vorigin(v));
-                if extra.base.is_some() {
-                    return Err("an offset from a root parameter");
+                if let Some(b) = extra.base {
+                    if self.is_const_base(b) && extra.dynamic.is_none() {
+                        extra.base = None;
+                        extra.dynamic = Some(b);
+                    } else {
+                        return Err("an offset from a root parameter");
+                    }
                 }
                 extra.offset = extra.offset.wrapping_add(off);
                 self.address(lo, hi, extra)
@@ -624,9 +667,72 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Recognizes a 256-byte-aligned (or power-of-two-aligned) 32-bit GPU
+    /// address passed in a single root-constant dword and reconstructed via
+    /// `s_lshl_b64 (const_dword, 0), shift` (optionally OR-ed with a constant
+    /// byte offset `< 1 << shift`).
+    fn shifted_const_address(&self, lo: Term, hi: Term, extra: &Sum) -> Option<Address> {
+        let mut lo = lo;
+        let mut or_bits = 0u32;
+        while let Term::Value(v) = lo
+            && let Some((x, bits)) = self.set_bits(v)
+        {
+            lo = x;
+            or_bits |= bits;
+        }
+        let (Term::Value(v_lo), Term::Value(v_hi)) = (lo, hi) else {
+            return None;
+        };
+        let site_lo = self.defs[v_lo.0 as usize]?;
+        let site_hi = self.defs[v_hi.0 as usize]?;
+        if site_lo != site_hi {
+            return None;
+        }
+        let inst = self.inst(site_lo);
+        if inst.name() != "s_lshl_b64"
+            || inst.writes.first()?.1 != v_lo
+            || inst.writes.get(1)?.1 != v_hi
+        {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        let Operand::Scalar { code, .. } = *src.first()? else {
+            return None;
+        };
+        let Term::Value(v_in) = self.origin(inst.read(Reg::S(code))?) else {
+            return None;
+        };
+        let Term::Const(0) = self.origin(inst.read(Reg::S(code + 1))?) else {
+            return None;
+        };
+        let Term::Const(shift) = self.term(inst, src.get(1)?)? else {
+            return None;
+        };
+        if !(1..=16).contains(&shift) || or_bits >= (1u32 << shift) {
+            return None;
+        }
+        let reg = self.inputs[v_in.0 as usize]?;
+        let (param, dword) = self.param_of(reg)?;
+        if self.layout[param].root != RootType::Constants {
+            return None;
+        }
+        Some(Address {
+            param,
+            dword,
+            shift: shift as u8,
+            offset: or_bits.wrapping_add(extra.offset),
+            dynamic: extra.dynamic,
+        })
+    }
+
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        if let Some(a) = self.shifted_const_address(lo, hi, &extra) {
+            return Ok(a);
+        }
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -640,6 +746,8 @@ impl<'a> Tracer<'a> {
             }
             return Ok(Address {
                 param: CODE,
+                dword: 0,
+                shift: 0,
                 offset: (pc.machine.offset as u32 + 4)
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
@@ -647,15 +755,25 @@ impl<'a> Tracer<'a> {
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
+        let (param, dword) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
-            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap if dword == 0 => None,
+            RootType::Descriptor if dword == 0 => {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
+            }
+            RootType::Constants if dword + 1 < self.layout[param].sgprs => {
+                let high =
+                    Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8 + 1);
+                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                Some(
+                    input
+                        .ok_or("a root constant address without its high half")?
+                        .1,
+                )
             }
             _ => return Err("an address from a root parameter that is no address"),
         };
@@ -669,6 +787,8 @@ impl<'a> Tracer<'a> {
         }
         Ok(Address {
             param,
+            dword,
+            shift: 0,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
         })
@@ -754,8 +874,13 @@ impl<'a> Tracer<'a> {
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
         );
-        if extra.base.is_some() {
-            return Err("an offset from a root parameter");
+        if let Some(b) = extra.base {
+            if self.is_const_base(b) && extra.dynamic.is_none() {
+                extra.base = None;
+                extra.dynamic = Some(b);
+            } else {
+                return Err("an offset from a root parameter");
+            }
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
         self.address(lo, hi, extra)
@@ -1759,6 +1884,8 @@ pub(crate) mod tests {
     fn at(param: usize, offset: u32) -> Address {
         Address {
             param,
+            dword: 0,
+            shift: 0,
             offset,
             dynamic: None,
         }
@@ -1998,6 +2125,99 @@ pub(crate) mod tests {
                 what: "a descriptor changed after loading"
             }
         );
+    }
+
+    #[test]
+    fn root_constant_addresses_are_tracked_at_any_dword_and_shift() {
+        let sop2 = |op: u32, dst: u32, s0: u32, s1: u32| {
+            (0b10 << 30) | (op << 23) | (dst << 16) | (s1 << 8) | s0
+        };
+        let smem = |op: u32, sdata: u32, sbase: u32, off: u32, soff: u32| {
+            [
+                (0x3D << 26) | (op << 18) | (sdata << 6) | (sbase >> 1),
+                (soff << 25) | (off & 0x1F_FFFF),
+            ]
+        };
+        let global =
+            |op: u32, vdst: u32, vaddr: u32, vdata: u32, saddr: u32, off: i16, glc: bool| {
+                [
+                    (0x37 << 26)
+                        | (op << 18)
+                        | (u32::from(glc) << 16)
+                        | (2 << 14)
+                        | ((off as u32) & 0xFFF),
+                    (vdst << 24) | (saddr << 16) | (vdata << 8) | vaddr,
+                ]
+            };
+
+        // 1. 64-bit GPU address in root constants at non-zero dword offset (dwords 2..3 -> s4..s5)
+        //    used with s_add_u32/s_addc_u32 + s_load_dword, global_store_dwordx3, and global_atomic_add.
+        let mut words = vec![
+            sop2(0x00, 8, 4, 0x90), // s_add_u32 s8, s4, 16
+            sop2(0x04, 9, 5, 0x80), // s_addc_u32 s9, s5, 0
+        ];
+        words.extend(smem(0x00, 10, 8, 0x20, 0x7D)); // s_load_dword s10, s[8:9], 0x20
+        words.extend(global(0x1F, 0, 0, 1, 4, 0x40, false)); // global_store_dwordx3 v0, v[1:3], s[4:5] offset:0x40
+        words.extend(global(0x32, 4, 0, 1, 4, 0x08, true)); // global_atomic_add v4, v0, v1, s[4:5] offset:8 glc
+        words.push(S_ENDPGM);
+        let r = track_words(&words, &[param(Constants, 2, 4)], HwStage::Cs);
+        assert_eq!(r.scalar.len(), 3);
+        assert_eq!(
+            r.scalar[0].1,
+            Address {
+                param: 0,
+                dword: 2,
+                shift: 0,
+                offset: 0x30,
+                dynamic: None,
+            }
+        );
+        assert_eq!(r.scalar[1].1.dword, 2);
+        assert_eq!(r.scalar[1].1.shift, 0);
+        assert_eq!(r.scalar[1].1.offset, 0x40);
+        assert!(r.scalar[1].1.dynamic.is_some());
+        assert_eq!(r.scalar[2].1.dword, 2);
+        assert_eq!(r.scalar[2].1.offset, 0x08);
+
+        // 2. Single 256-byte-aligned 32-bit GPU address in root constants shifted left by 8
+        //    via s_lshl_b64, with low offset bits OR-ed in.
+        let mut shifted = vec![
+            0xBE86_0302,            // s_mov_b32 s6, s2
+            0xBE87_0380,            // s_mov_b32 s7, 0
+            sop2(0x1F, 6, 6, 0x88), // s_lshl_b64 s[6:7], s[6:7], 8
+            sop2(0x10, 6, 6, 0x90), // s_or_b32 s6, s6, 16
+        ];
+        shifted.extend(smem(0x00, 8, 6, 0x04, 0x7D)); // s_load_dword s8, s[6:7], 4
+        shifted.push(S_ENDPGM);
+        let r = track_words(&shifted, &[param(Constants, 2, 1)], HwStage::Cs);
+        assert_eq!(
+            r.scalar,
+            [(
+                (0, 4),
+                Address {
+                    param: 0,
+                    dword: 0,
+                    shift: 8,
+                    offset: 20,
+                    dynamic: None,
+                }
+            )]
+        );
+
+        // 3. A root constant used as soffset on a Table base must stay dynamic, not conflict.
+        let mut soff = vec![
+            0xBE82_0302, // s_mov_b32 s2, s2
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        soff.extend(smem(0x02, 8, 2, 0x00, 4)); // s_load_dwordx4 s[8:11], s[2:3], s4
+        soff.push(S_ENDPGM);
+        let r = track_words(
+            &soff,
+            &[param(Table, 2, 1), param(Constants, 4, 1)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar[0].1.param, 0);
+        assert!(r.scalar[0].1.dynamic.is_some());
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, RootConstAddr, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -210,6 +210,14 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    for addrs in [&s.const_srvs, &s.const_uavs] {
+        word(&mut out, addrs.len() as u32);
+        for a in addrs {
+            for v in [u32::from(a.slot), a.dword, u32::from(a.shift)] {
+                word(&mut out, v);
+            }
+        }
+    }
     out
 }
 
@@ -266,6 +274,20 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let mut read_const_addrs = || -> Option<Vec<RootConstAddr>> {
+        let n = r.word()? as usize;
+        let mut out = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            out.push(RootConstAddr {
+                slot: u8::try_from(r.word()?).ok()?,
+                dword: r.word()?,
+                shift: u8::try_from(r.word()?).ok()?,
+            });
+        }
+        Some(out)
+    };
+    let const_srvs = read_const_addrs()?;
+    let const_uavs = read_const_addrs()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +296,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        const_srvs,
+        const_uavs,
     })
 }
 
@@ -300,6 +324,16 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            const_srvs: vec![RootConstAddr {
+                slot: 4,
+                dword: 2,
+                shift: 8,
+            }],
+            const_uavs: vec![RootConstAddr {
+                slot: 5,
+                dword: 0,
+                shift: 0,
+            }],
         }
     }
 

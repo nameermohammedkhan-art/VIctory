@@ -2,10 +2,16 @@
 //! so fence signals complete at once.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(windows)]
+use std::collections::VecDeque;
+#[cfg(windows)]
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
+
+static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -34,6 +40,7 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    id: u64,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -61,6 +68,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        id: NEXT_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -107,11 +115,230 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Queue>(this)
+    let id = queue(this).id;
+    let left = object::release_boxed::<Queue>(this);
+    #[cfg(windows)]
+    if left == 0 {
+        scheduler::drop_if_empty(id);
+    }
+    #[cfg(not(windows))]
+    let _ = id;
+    left
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+#[cfg(windows)]
+mod scheduler {
+    use super::*;
+    use crate::host::{Host, HostList};
+    use crate::list::MemoryWait;
+
+    enum QueueOp {
+        Run {
+            wait: Option<MemoryWait>,
+            list: Arc<HostList>,
+        },
+        Signal {
+            fence: usize,
+            value: u64,
+        },
+    }
+
+    #[derive(Default)]
+    struct State {
+        queues: Vec<(u64, VecDeque<QueueOp>)>,
+    }
+
+    impl State {
+        fn queue_mut(&mut self, id: u64) -> &mut VecDeque<QueueOp> {
+            if let Some(pos) = self.queues.iter().position(|(q, _)| *q == id) {
+                return &mut self.queues[pos].1;
+            }
+            self.queues.push((id, VecDeque::new()));
+            &mut self.queues.last_mut().expect("pushed").1
+        }
+
+        fn has_pending(&self, id: u64) -> bool {
+            self.queues
+                .iter()
+                .any(|(q, ops)| *q == id && !ops.is_empty())
+        }
+
+        fn is_empty(&self) -> bool {
+            self.queues.iter().all(|(_, ops)| ops.is_empty())
+        }
+    }
+
+    /// Lock order: always `DRAIN_LOCK` before `STATE`.
+    static DRAIN_LOCK: Mutex<()> = Mutex::new(());
+    static STATE: Mutex<State> = Mutex::new(State { queues: Vec::new() });
+    /// Fast-path flag: true while any queue holds pending ops.
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    static WATCHER_WAKE: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+
+    fn wake_watcher() {
+        let wake = WATCHER_WAKE.get_or_init(|| {
+            let pair = (Mutex::new(false), Condvar::new());
+            let _ = std::thread::Builder::new()
+                .name("victory-gpu-wait".into())
+                .spawn(watcher_loop);
+            pair
+        });
+        let mut active = wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        *active = true;
+        wake.1.notify_one();
+    }
+
+    fn watcher_loop() {
+        let Some(wake) = WATCHER_WAKE.get() else {
+            return;
+        };
+        loop {
+            {
+                let mut active = wake.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !*active && !PENDING.load(Ordering::Acquire) {
+                    active = wake.1.wait(active).unwrap_or_else(|e| e.into_inner());
+                }
+                *active = false;
+            }
+            while PENDING.load(Ordering::Acquire) {
+                if let Some(host) = crate::host::host() {
+                    drain_ready(host);
+                }
+                if !PENDING.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Enqueues segments onto guest queue `id` and drains every ready operation
+    /// across all queues.
+    pub(super) fn submit(
+        host: &Host,
+        id: u64,
+        segments: Vec<(Option<MemoryWait>, Arc<HostList>)>,
+    ) {
+        if segments.is_empty() {
+            return;
+        }
+        if !PENDING.load(Ordering::Acquire) && segments.iter().all(|(w, _)| w.is_none()) {
+            let refs: Vec<&HostList> = segments.iter().map(|(_, l)| l.as_ref()).collect();
+            host.execute(&refs);
+            return;
+        }
+        {
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let q = state.queue_mut(id);
+            for (wait, list) in segments {
+                q.push_back(QueueOp::Run { wait, list });
+            }
+            PENDING.store(true, Ordering::Release);
+        }
+        drain_ready(host);
+    }
+
+    /// Signals `fence` to `value` in queue `id`'s FIFO order: immediately if
+    /// queue `id` has no pending work, or queued behind its waiting lists.
+    pub(super) fn signal(id: u64, fence: This, value: u64) -> HRESULT {
+        if PENDING.load(Ordering::Acquire) {
+            let queued = {
+                let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                if state.has_pending(id) {
+                    object::add_ref(fence);
+                    state.queue_mut(id).push_back(QueueOp::Signal {
+                        fence: fence as usize,
+                        value,
+                    });
+                    true
+                } else {
+                    false
+                }
+            };
+            if queued {
+                if let Some(host) = crate::host::host() {
+                    drain_ready(host);
+                }
+                return S_OK;
+            }
+        }
+        crate::fence::signal(fence, value)
+    }
+
+    pub(super) fn drop_if_empty(id: u64) {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.queues.retain(|(q, ops)| *q != id || !ops.is_empty());
+        PENDING.store(!state.is_empty(), Ordering::Release);
+    }
+
+    enum Ready {
+        Batch(Vec<Arc<HostList>>),
+        Signal(This, u64),
+    }
+
+    /// Executes every ready queue head in FIFO order until no queue can advance.
+    pub(super) fn drain_ready(host: &Host) {
+        let _drain = DRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let next = {
+                let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let mut found = None;
+                for (_, ops) in &mut state.queues {
+                    let ready = match ops.front() {
+                        Some(QueueOp::Signal { .. }) => true,
+                        Some(QueueOp::Run { wait: None, .. }) => true,
+                        Some(QueueOp::Run {
+                            wait: Some(w), ..
+                        }) => w.is_satisfied(),
+                        None => false,
+                    };
+                    if !ready {
+                        continue;
+                    }
+                    match ops.pop_front().expect("checked front") {
+                        QueueOp::Signal { fence, value } => {
+                            found = Some(Ready::Signal(fence as This, value));
+                        }
+                        QueueOp::Run { list, .. } => {
+                            let mut batch = vec![list];
+                            while matches!(ops.front(), Some(QueueOp::Run { wait: None, .. })) {
+                                if let Some(QueueOp::Run { list, .. }) = ops.pop_front() {
+                                    batch.push(list);
+                                }
+                            }
+                            found = Some(Ready::Batch(batch));
+                        }
+                    }
+                    break;
+                }
+                if found.is_none() {
+                    let has_more = !state.is_empty();
+                    PENDING.store(has_more, Ordering::Release);
+                    if has_more {
+                        wake_watcher();
+                    }
+                }
+                found
+            };
+            match next {
+                Some(Ready::Batch(batch)) => {
+                    let refs: Vec<&HostList> = batch.iter().map(Arc::as_ref).collect();
+                    host.execute(&refs);
+                }
+                Some(Ready::Signal(fence, value)) => {
+                    let _ = crate::fence::signal(fence, value);
+                    crate::fence::release(fence);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// Runs the lists' host lists (in per-queue FIFO order, honoring 64-bit memory
+/// waits without blocking the submitting thread when an unsatisfied wait is
+/// encountered).
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -119,13 +346,15 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
+        let segments: Vec<_> = lists
             .iter()
-            .filter_map(|&l| crate::list::host_list(l))
+            .flat_map(|&l| crate::list::host_segments(l))
             .collect();
-        host.execute(&host_lists);
+        scheduler::submit(host, queue(this).id, segments);
         return;
     }
+    #[cfg(not(windows))]
+    let _ = this;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
@@ -157,11 +386,19 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+    #[cfg(windows)]
+    {
+        scheduler::signal(queue(this).id, fence, value)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = this;
+        crate::fence::signal(fence, value)
+    }
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
@@ -205,10 +442,13 @@ impl Written {
         unsafe {
             if bytes == 4 {
                 at.cast::<u32>().write_unaligned(value as u32);
+            } else if (at as usize).is_multiple_of(8) {
+                at.cast::<u64>().write_volatile(value);
             } else {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        std::sync::atomic::fence(Ordering::Release);
     }
 }
 
@@ -543,5 +783,214 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn wait_value64_comparisons_cover_full_64bit_range() {
+        use crate::list::MemoryWait;
+        let hi = 0x0001_0000_0000_0005u64;
+        let lo = 0x0000_0000_0000_0005u64;
+        assert!(!MemoryWait::compare(hi, 1, hi)); // NEVER
+        assert!(MemoryWait::compare(lo, 2, hi)); // LESS
+        assert!(!MemoryWait::compare(hi, 2, hi));
+        assert!(MemoryWait::compare(hi, 3, hi)); // EQUAL
+        assert!(!MemoryWait::compare(lo, 3, hi));
+        assert!(MemoryWait::compare(hi, 4, hi)); // LESS_EQUAL
+        assert!(MemoryWait::compare(lo, 4, hi));
+        assert!(!MemoryWait::compare(hi, 4, lo));
+        assert!(MemoryWait::compare(hi, 5, lo)); // GREATER
+        assert!(!MemoryWait::compare(hi, 5, hi));
+        assert!(MemoryWait::compare(hi, 6, lo)); // NOT_EQUAL
+        assert!(!MemoryWait::compare(hi, 6, hi));
+        assert!(MemoryWait::compare(hi, 7, hi)); // GREATER_EQUAL
+        assert!(MemoryWait::compare(hi, 7, lo));
+        assert!(!MemoryWait::compare(lo, 7, hi));
+        assert!(MemoryWait::compare(lo, 8, hi)); // ALWAYS
+    }
+
+    /// Reproduces issue #700: producer writes payload and counter via
+    /// bottom-of-pipe `WriteValue64`; consumer waits via `WaitValue64`
+    /// (`comparison = 7`, GREATER_EQUAL) then copies payload to result.
+    /// Must produce the payload in both producer-first and consumer-first
+    /// submission orders, preserve pre-wait work on mid-list waits, hold
+    /// subsequent queue signals until the wait releases, and wake on CPU writes.
+    #[test]
+    #[cfg(windows)]
+    fn command_list_64bit_memory_wait_orders_cross_queue_and_mid_list_work() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let make_queue = || {
+            let desc = QueueDesc {
+                kind: 0,
+                priority: 0,
+                flags: 0,
+                nodes: 0,
+            };
+            let mut q = null;
+            assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+            q
+        };
+        let make_list = || {
+            let mut alloc = null;
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &crate::list::ALLOCATOR_IIDS[0], &mut alloc),
+                S_OK
+            );
+            let mut l = null;
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, alloc, null, &crate::list::LIST_IIDS[0], &mut l),
+                S_OK
+            );
+            (alloc, l)
+        };
+        let exec = |q: This, list: This| {
+            let f = slot::<extern "system" fn(This, u32, *const This)>(q, 0x50);
+            f(q, 1, &list);
+        };
+        let close = |l: This| {
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(l, 0x48)(l), S_OK);
+        };
+        let write64 = |l: This, addr: u64, val: u64| {
+            let off = crate::list::slot_offset(l, 70);
+            slot::<extern "system" fn(This, u64, u64, u32, u32)>(l, off)(l, addr, val, 0, 0);
+        };
+        let wait64 = |l: This, addr: u64, cmp: u32, reference: u64, flags: u32| {
+            let off = crate::list::slot_offset(l, 72);
+            slot::<extern "system" fn(This, u64, u32, u64, u32)>(l, off)(
+                l, addr, cmp, reference, flags,
+            );
+        };
+        let copy_mem = |l: This, dst: u64, src: u64, len: u64| {
+            let off = crate::list::slot_offset(l, 60);
+            slot::<extern "system" fn(This, u64, u64, u64, u32)>(l, off)(l, dst, src, len, 0);
+        };
+        let release = |o: This| {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        };
+
+        // 1. Producer-first and consumer-first submissions with mid-list wait
+        //    and deferred queue Signal.
+        for consumer_first in [false, true] {
+            let q_prod = make_queue();
+            let q_cons = make_queue();
+            let (a_prod, l_prod) = make_list();
+            let (a_cons, l_cons) = make_list();
+            let mut fence = null;
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+                S_OK
+            );
+
+            let mut words = Box::new([0u64; 5]); // payload, counter, result, before, after
+            let base = words.as_mut_ptr();
+            // SAFETY: offsets 0..5 lie inside the boxed 5-element array.
+            let (payload, counter, result, before, after) = unsafe {
+                (
+                    base.add(0) as u64,
+                    base.add(1) as u64,
+                    base.add(2) as u64,
+                    base.add(3) as u64,
+                    base.add(4) as u64,
+                )
+            };
+
+            // Producer: write payload then counter = 2.
+            write64(l_prod, payload, 0x5a55_a11c);
+            write64(l_prod, counter, 2);
+            close(l_prod);
+
+            // Consumer: pre-wait write, wait counter >= 1 (cmp 7), copy payload -> result, post-wait write.
+            write64(l_cons, before, 0x1111_2222);
+            wait64(l_cons, counter, 7, 1, 0);
+            copy_mem(l_cons, result, payload, 8);
+            write64(l_cons, after, 0x3333_4444);
+            close(l_cons);
+
+            let sig = slot::<extern "system" fn(This, This, u64) -> HRESULT>(
+                q_cons,
+                signal_slot(q_cons),
+            );
+            let fence_val = || slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence);
+
+            if consumer_first {
+                exec(q_cons, l_cons);
+                assert_eq!(sig(q_cons, fence, 9), S_OK);
+                // Pre-wait segment ran immediately; post-wait segment & signal are parked.
+                assert_eq!(words[3], 0x1111_2222, "pre-wait work must run before wait");
+                assert_eq!(words[2], 0, "post-wait copy must not run before producer");
+                assert_eq!(words[4], 0, "post-wait write must not run before producer");
+                assert_eq!(fence_val(), 0, "queued signal must wait behind consumer list");
+
+                exec(q_prod, l_prod);
+            } else {
+                exec(q_prod, l_prod);
+                exec(q_cons, l_cons);
+                assert_eq!(sig(q_cons, fence, 9), S_OK);
+            }
+
+            assert_eq!(words[1], 2, "final counter (consumer_first={consumer_first})");
+            assert_eq!(
+                words[0], 0x5a55_a11c,
+                "final payload (consumer_first={consumer_first})"
+            );
+            assert_eq!(
+                words[2], 0x5a55_a11c,
+                "copied result (consumer_first={consumer_first})"
+            );
+            assert_eq!(words[3], 0x1111_2222);
+            assert_eq!(words[4], 0x3333_4444);
+            assert_eq!(fence_val(), 9, "deferred signal must fire once released");
+
+            release(fence);
+            release(l_prod);
+            release(a_prod);
+            release(l_cons);
+            release(a_cons);
+            release(q_prod);
+            release(q_cons);
+        }
+
+        // 2. CPU-written wake: consumer parked on a 64-bit value written later by CPU.
+        {
+            let q = make_queue();
+            let (a, l) = make_list();
+            let mut words = Box::new([0xfeed_face_cafe_babe_u64, 0u64, 0u64]);
+            let base = words.as_mut_ptr();
+            // SAFETY: offsets 0..3 lie inside the boxed 3-element array.
+            let (payload, gate, result) = unsafe {
+                (base.add(0) as u64, base.add(1) as u64, base.add(2) as u64)
+            };
+            let target = 0x0000_0002_0000_0001_u64;
+            wait64(l, gate, 3, target, 1); // EQUAL full 64-bit value
+            copy_mem(l, result, payload, 8);
+            close(l);
+
+            exec(q, l);
+            assert_eq!(words[2], 0);
+
+            // SAFETY: 8-byte aligned live boxed word.
+            unsafe { (gate as *mut u64).write_volatile(target) };
+            std::sync::atomic::fence(Ordering::Release);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                // SAFETY: 8-byte aligned live boxed word.
+                let got = unsafe { (result as *const u64).read_volatile() };
+                if got == 0xfeed_face_cafe_babe {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watcher thread did not release CPU-satisfied 64-bit wait"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+
+            release(l);
+            release(a);
+            release(q);
+        }
     }
 }

@@ -64,6 +64,13 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Fixed-function state replayed onto a new host segment after a mid-list wait.
+    rtv_handles: Vec<u64>,
+    dsv_handle: u64,
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    blend_factor: Option<[f32; 4]>,
+    stencil_ref: Option<u32>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -172,6 +179,56 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Replays live fixed-function state onto a fresh host command list
+    /// opened after a mid-list memory wait, and invalidates host-list caches
+    /// so the next draw or dispatch rebinds them on the new segment.
+    pub(crate) fn rebind_segment(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if let Some(factor) = self.blend_factor {
+            blend_factor(list, Some(&factor));
+        }
+        if let Some(reference) = self.stencil_ref {
+            stencil_ref(list, reference);
+        }
+        if !self.rtv_handles.is_empty() || self.dsv_handle != 0 {
+            let handles = self.rtv_handles.clone();
+            let depth = self.dsv_handle;
+            self.set_targets(list, &handles, depth);
+        }
+    }
+
+    pub(crate) fn set_viewports(&mut self, list: &HostList, vp: &[D3D12_VIEWPORT]) {
+        self.viewports = vp.to_vec();
+        viewports(list, vp);
+    }
+
+    pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        self.scissors = rects.to_vec();
+        scissors(list, rects);
+    }
+
+    pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
+        self.blend_factor = factor.copied();
+        blend_factor(list, factor);
+    }
+
+    pub(crate) fn set_stencil_ref(&mut self, list: &HostList, reference: u32) {
+        self.stencil_ref = Some(reference);
+        stencil_ref(list, reference);
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -256,6 +313,8 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        self.rtv_handles = handles.to_vec();
+        self.dsv_handle = depth;
         let Some(host) = crate::host::host() else {
             return;
         };

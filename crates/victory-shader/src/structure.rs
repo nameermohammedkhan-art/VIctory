@@ -345,6 +345,10 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Non-derived values read as lane masks (constants, uniform `s_cselect`,
+    /// opaque masks), kept separate from `masks` so scalar ALU instructions
+    /// that define them are still lowered as ordinary scalars.
+    pub other_masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -353,6 +357,9 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Values restored by `v_readlane_b32` from a spilled lane mask: lowered
+    /// directly as lane masks rather than reading the spill VGPR as data.
+    pub spilled_masks: HashSet<Value>,
 }
 
 impl Structured {
@@ -413,6 +420,10 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Restored SGPR `v_readlane_b32` results -> the spilled SGPR value.
+    spilled_halves: Map<Value, Value>,
+    /// See [`Structured::spilled_masks`].
+    spilled_masks: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +487,8 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            spilled_halves: Map::default(),
+            spilled_masks: HashSet::new(),
         })
     }
 
@@ -488,6 +501,8 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.spilled_halves.clear();
+        self.spilled_masks.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -523,8 +538,40 @@ impl<'a> Lanes<'a> {
                     self.active.insert(phi.value);
                 }
             }
-            // EXEC where known in this block (read or written so far).
+            // EXEC where known in this block (read or written so far); seed
+            // from an EXEC phi or the first EXEC-reading instruction before
+            // any EXEC write so early mask ops know the active lanes.
             let mut now = None;
+            if let Some(lo) = p.blocks[b]
+                .phis
+                .iter()
+                .find(|phi| phi.reg == Reg::S(EXEC))
+                .map(|phi| phi.value)
+            {
+                let hi = if p.wave64 {
+                    p.blocks[b]
+                        .phis
+                        .iter()
+                        .find(|phi| phi.reg == Reg::S(EXEC + 1))
+                        .map(|phi| phi.value)
+                } else {
+                    Some(lo)
+                };
+                if let Some(hi) = hi {
+                    now = Some(self.mask((lo, hi)).0);
+                }
+            }
+            if now.is_none() {
+                for inst in &p.blocks[b].insts {
+                    if inst.read(Reg::S(EXEC)).is_some() {
+                        now = Some(self.exec(inst));
+                        break;
+                    }
+                    if inst.write(Reg::S(EXEC)).is_some() {
+                        break;
+                    }
+                }
+            }
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
@@ -626,14 +673,20 @@ impl<'a> Lanes<'a> {
         }
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other_masks: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
+            spilled_masks: self.spilled_masks,
             bools: self.b,
             exits,
             guards,
@@ -678,6 +731,23 @@ impl<'a> Lanes<'a> {
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {
+                if let (Some(&sv0), Some(&sv1)) =
+                    (self.spilled_halves.get(&k.0), self.spilled_halves.get(&k.1))
+                    && (sv0, sv1) != k
+                {
+                    let (m, derived) = self.mask((sv0, sv1));
+                    if derived {
+                        self.spilled_masks.insert(k.0);
+                        self.spilled_masks.insert(k.1);
+                    }
+                    let cache = if derived {
+                        &mut self.masks
+                    } else {
+                        &mut self.other
+                    };
+                    cache.insert(k, m);
+                    return (m, derived);
+                }
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
                 let m = match (lo, hi) {
@@ -973,10 +1043,34 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
-                    && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
+                // Track SGPR lane masks spilled to a VGPR lane via
+                // `v_writelane_b32` and restored via `v_readlane_b32`.
+                if name == "v_readlane_b32"
+                    && let Some(Operand::Scalar { code, .. }) = v.dst
+                    && code != NULL
+                    && let [Operand::Vector { reg, .. }, lane_op] = v.src[..]
+                    && let Some(lane) = Self::const_lane(lane_op)
+                    && let Some(vgpr_v) = inst.read(Reg::V(reg))
+                    && let Ok(Some(sv)) = self.spilled_value(vgpr_v, lane, &mut Vec::new())
+                    && let Some(dst_v) = inst.write(Reg::S(code))
+                {
+                    self.spilled_halves.insert(dst_v, sv);
+                    if !self.p.wave64
+                        && let Some(&m) = self.masks.get(&(sv, sv))
+                    {
+                        self.masks.insert((dst_v, dst_v), m);
+                        self.spilled_masks.insert(dst_v);
+                        if self.b.implies(m, exec) {
+                            self.active.insert(dst_v);
+                        }
+                    }
+                }
+                // A select or carry-in reads a mask nothing else may: a join
+                // of compare results or uniform select is resolved here.
+                if matches!(
+                    name,
+                    "v_cndmask_b32" | "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32"
+                ) && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
@@ -998,6 +1092,60 @@ impl<'a> Lanes<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn const_lane(op: Operand) -> Option<u32> {
+        match op {
+            Operand::Const(c @ 128..=192) => Some(u32::from(c) - 128),
+            Operand::Literal(x) if x < 64 => Some(x),
+            _ => None,
+        }
+    }
+
+    /// Walks `v_writelane_b32` writes and VGPR phis to recover an SGPR value
+    /// spilled into `lane` of VGPR value `v`.
+    fn spilled_value(
+        &self,
+        v: Value,
+        lane: u32,
+        seen: &mut Vec<Value>,
+    ) -> Result<Option<Value>, ()> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            if seen.contains(&v) {
+                return Ok(None);
+            }
+            seen.push(v);
+            let mut found = None;
+            for &arg in &self.p.blocks[b].phis[i].args {
+                match self.spilled_value(arg, lane, seen)? {
+                    None => {}
+                    Some(x) if found.is_none() || found == Some(x) => found = Some(x),
+                    Some(_) => return Err(()),
+                }
+            }
+            return Ok(found);
+        }
+        let &(b, i) = self.defs.get(&v).ok_or(())?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Valu(val) = &inst.fields else {
+            return Err(());
+        };
+        if inst.name() != "v_writelane_b32" {
+            return Err(());
+        }
+        let Some(Operand::Vector { reg, .. }) = val.dst else {
+            return Err(());
+        };
+        let [src_op, at_op] = val.src[..] else {
+            return Err(());
+        };
+        if Self::const_lane(at_op).ok_or(())? != lane {
+            return self.spilled_value(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+        }
+        match src_op {
+            Operand::Scalar { code, .. } if code != NULL => Ok(inst.read(Reg::S(code))),
+            _ => Err(()),
         }
     }
 

@@ -3323,23 +3323,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let n = self.constant_sampler_index(words, props)?;
+                Ok(self.s.sampler_handle(self.cur, n))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -3366,47 +3351,13 @@ impl<'a> Lower<'a> {
                     _ => Err("a root UAV or typed root view"),
                 }
             }
-            Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+            Source::Phi { .. } | Source::Select { .. } if Self::all_loaded(src) => {
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = self.heap_index(*load, *first, sampler);
-                    self.cur = here;
-                    incoming.push((index?, at));
-                }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
-            }
-            Source::Select { scc, args } => {
-                // The heap index of each choice, picked by SCC (uniform).
-                let [
-                    Source::Loaded { load: a, first: fa },
-                    Source::Loaded { load: b, first: fb },
-                ] = args[..]
-                else {
-                    return Err("a descriptor chosen by a condition");
-                };
-                let cond = match self.get(*scc)? {
-                    Val::Bit(x) => x,
-                    _ => return Err("SCC without a value"),
-                };
-                let set = self.heap_index(a, fa, sampler)?;
-                let clear = self.heap_index(b, fb, sampler)?;
-                let index = self.s.m.select(self.cur, cond, set, clear);
+                let index = self.uniform_heap_index(src, sampler)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
+            Source::Phi { .. } => Err("a descriptor chosen by control flow"),
+            Source::Select { .. } => Err("a descriptor chosen by a condition"),
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
@@ -3415,6 +3366,220 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
             }
         }
+    }
+
+    /// Registers an immediate sampler's four words and returns its static
+    /// sampler index.
+    fn constant_sampler_index(&mut self, words: &[u32], props: (u32, u32)) -> Result<u32, Why> {
+        let words: [u32; 4] = words
+            .get(..4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or("a sampler constant")?;
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(n as u32)
+    }
+
+    fn all_loaded(src: &Source) -> bool {
+        match src {
+            Source::Loaded { .. } => true,
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().all(Self::all_loaded)
+            }
+            _ => false,
+        }
+    }
+
+    fn all_constant(src: &Source) -> bool {
+        match src {
+            Source::Constant(_) => true,
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().all(Self::all_constant)
+            }
+            _ => false,
+        }
+    }
+
+    /// The heap index of a uniform descriptor loaded from a heap or chosen
+    /// across control flow / uniform selects.
+    fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Phi { block, args } => {
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.uniform_heap_index(arg, sampler);
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            Source::Select { scc, args } => {
+                let [a, b] = &args[..] else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.uniform_heap_index(a, sampler)?;
+                let clear = self.uniform_heap_index(b, sampler)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            _ => Err("a descriptor chosen by control flow"),
+        }
+    }
+
+    /// The `i32` static-sampler index of a uniform immediate sampler chosen
+    /// across control flow or uniform selects, recording each distinct index
+    /// in `choices`.
+    fn uniform_constant_sampler_index(
+        &mut self,
+        src: &Source,
+        props: (u32, u32),
+        choices: &mut Vec<u32>,
+    ) -> Result<V, Why> {
+        match src {
+            Source::Constant(words) => {
+                let n = self.constant_sampler_index(words, props)?;
+                if !choices.contains(&n) {
+                    choices.push(n);
+                }
+                Ok(self.s.m.i32(n))
+            }
+            Source::Phi { block, args } => {
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let idx = self.uniform_constant_sampler_index(arg, props, choices);
+                    self.cur = here;
+                    incoming.push((idx?, at));
+                }
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            Source::Select { scc, args } => {
+                let [a, b] = &args[..] else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.uniform_constant_sampler_index(a, props, choices)?;
+                let clear = self.uniform_constant_sampler_index(b, props, choices)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            _ => Err("a descriptor chosen by control flow"),
+        }
+    }
+
+    /// Resolves a sampler descriptor: either a single handle, or (for static
+    /// samplers chosen uniformly across control flow/selects) a selector value
+    /// and the distinct static sampler indices to dispatch over. DXIL forbids
+    /// `phi`/`select` directly on `%dx.types.Handle` and D3D12 forbids dynamic
+    /// indexing of static samplers, so distinct static choices dispatch via a
+    /// uniform branch chain around the sample call.
+    fn resolve_sampler(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+    ) -> Result<(Option<V>, Option<(V, Vec<u32>)>), Why> {
+        if matches!(src, Source::Phi { .. } | Source::Select { .. }) && Self::all_constant(src) {
+            let mut choices = Vec::new();
+            let idx = self.uniform_constant_sampler_index(src, props, &mut choices)?;
+            if choices.len() == 1 {
+                return Ok((Some(self.s.sampler_handle(self.cur, choices[0])), None));
+            }
+            if choices.is_empty() {
+                return Err("a descriptor chosen by control flow");
+            }
+            return Ok((None, Some((idx, choices))));
+        }
+        Ok((Some(self.handle(site, src, true, props)?), None))
+    }
+
+    /// Calls a sampling `dx.op` returning `dx.types.ResRet.f32` and extracts
+    /// `channels`, dispatching across a uniform branch chain when the sampler
+    /// is chosen among several static samplers.
+    fn sample_channels(
+        &mut self,
+        sampler: (Option<V>, Option<(V, Vec<u32>)>),
+        op_name: &str,
+        op: u32,
+        mut args: Vec<V>,
+        channels: &[u32],
+    ) -> Vec<V> {
+        if let Some(sh) = sampler.0 {
+            args[1] = sh;
+            let r = self
+                .s
+                .op(self.cur, op_name, Attr::ReadOnly, self.s.t.res_ret, op, &args);
+            return channels
+                .iter()
+                .map(|&ch| self.s.m.extract(self.cur, r, ch))
+                .collect();
+        }
+        let (idx, choices) = sampler.1.expect("static sampler choices");
+        let merge = self.s.m.new_block();
+        let mut per_ch: Vec<Vec<(V, usize)>> = vec![Vec::with_capacity(choices.len()); channels.len()];
+        for (k, &sn) in choices.iter().enumerate() {
+            let arm = if k + 1 < choices.len() {
+                let hit = self.s.m.new_block();
+                let next = self.s.m.new_block();
+                let sn_v = self.s.m.i32(sn);
+                let eq = self.s.m.cmp(self.cur, pred::EQ, idx, sn_v);
+                self.s.m.terminate(self.cur, Term::CondBr(eq, hit, next));
+                self.cur = next;
+                hit
+            } else {
+                self.cur
+            };
+            args[1] = self.s.sampler_handle(arm, sn);
+            let r = self
+                .s
+                .op(arm, op_name, Attr::ReadOnly, self.s.t.res_ret, op, &args);
+            for (slot, &ch) in per_ch.iter_mut().zip(channels) {
+                slot.push((self.s.m.extract(arm, r, ch), arm));
+            }
+            self.s.m.terminate(arm, Term::Br(merge));
+        }
+        self.cur = merge;
+        per_ch
+            .into_iter()
+            .map(|incoming| {
+                let phi = self.s.m.phi(merge, self.s.t.f32);
+                self.s.m.set_phi(phi, incoming);
+                phi
+            })
+            .collect()
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -5833,7 +5998,15 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let r = if sample {
+        let Operand::Vector { reg, .. } = *data else {
+            return Err("an image result");
+        };
+        let channels: Vec<u32> = if op == 73 {
+            vec![0, 1, 2, 3]
+        } else {
+            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
+        };
+        let vals = if sample {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -5845,7 +6018,8 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let sampler_sel =
+                self.resolve_sampler(site, ss, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -5892,20 +6066,66 @@ impl<'a> Lower<'a> {
             }
             if op == 81 {
                 // The clamped then the unclamped level of detail.
-                let Operand::Vector { reg, .. } = *data else {
-                    return Err("an image result");
-                };
                 let f32t = self.s.t.f32;
-                for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                    let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
-                        c,
-                        "calculateLOD.f32",
-                        Attr::ReadOnly,
-                        f32t,
-                        81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
-                    );
+                let lod_channels: Vec<u32> = (0..2u32).filter(|ch| dmask >> ch & 1 != 0).collect();
+                let lods: Vec<V> = if let Some(sh) = sampler_sel.0 {
+                    lod_channels
+                        .iter()
+                        .map(|&ch| {
+                            let clamped = self.s.m.bool(ch == 0);
+                            self.s.op(
+                                self.cur,
+                                "calculateLOD.f32",
+                                Attr::ReadOnly,
+                                f32t,
+                                81,
+                                &[h, sh, cs[0], cs[1], cs[2], clamped],
+                            )
+                        })
+                        .collect()
+                } else {
+                    let (idx, choices) = sampler_sel.1.expect("static sampler choices");
+                    let merge = self.s.m.new_block();
+                    let mut per_ch: Vec<Vec<(V, usize)>> =
+                        vec![Vec::with_capacity(choices.len()); lod_channels.len()];
+                    for (k, &sn) in choices.iter().enumerate() {
+                        let arm = if k + 1 < choices.len() {
+                            let hit = self.s.m.new_block();
+                            let next = self.s.m.new_block();
+                            let sn_v = self.s.m.i32(sn);
+                            let eq = self.s.m.cmp(self.cur, pred::EQ, idx, sn_v);
+                            self.s.m.terminate(self.cur, Term::CondBr(eq, hit, next));
+                            self.cur = next;
+                            hit
+                        } else {
+                            self.cur
+                        };
+                        let sh = self.s.sampler_handle(arm, sn);
+                        for (slot, &ch) in per_ch.iter_mut().zip(&lod_channels) {
+                            let clamped = self.s.m.bool(ch == 0);
+                            let lod = self.s.op(
+                                arm,
+                                "calculateLOD.f32",
+                                Attr::ReadOnly,
+                                f32t,
+                                81,
+                                &[h, sh, cs[0], cs[1], cs[2], clamped],
+                            );
+                            slot.push((lod, arm));
+                        }
+                        self.s.m.terminate(arm, Term::Br(merge));
+                    }
+                    self.cur = merge;
+                    per_ch
+                        .into_iter()
+                        .map(|incoming| {
+                            let phi = self.s.m.phi(merge, f32t);
+                            self.s.m.set_phi(phi, incoming);
+                            phi
+                        })
+                        .collect()
+                };
+                for (k, lod) in lods.into_iter().enumerate() {
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -5921,9 +6141,9 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
-            let mut args = vec![h, sh];
+            let mut args = vec![h, h];
             args.extend(&cs);
-            match op {
+            let op_name = match op {
                 60 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
@@ -5946,22 +6166,14 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    "sample.f32"
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    "sampleBias.f32"
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -5974,28 +6186,19 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(fu);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    "sampleGrad.f32"
                 }
                 64 | 65 => {
                     let reference = addr_val(self, first - 1)?;
                     let reference = self.as_float(reference);
                     args.extend(&os);
                     args.push(reference);
-                    let name = if op == 64 {
+                    if op == 64 {
                         args.push(fu);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"
-                    };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    }
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -6006,14 +6209,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    "sampleLevel.f32"
                 }
                 _ => {
                     if name == "image_gather4" {
@@ -6034,16 +6230,10 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    "textureGather.f32"
                 }
-            }
+            };
+            self.sample_channels(sampler_sel, op_name, op, args, &channels)
         } else {
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6061,26 +6251,22 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
+            let r = self.s.op(
                 c,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 66,
                 &args,
-            )
+            );
+            channels
+                .iter()
+                .map(|&ch| self.s.m.extract(c, r, ch))
+                .collect()
         };
-        let Operand::Vector { reg, .. } = *data else {
-            return Err("an image result");
-        };
-        let channels: Vec<u32> = if op == 73 {
-            vec![0, 1, 2, 3]
-        } else {
-            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
-        };
+        let c = self.cur;
         let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+        for x in vals {
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.

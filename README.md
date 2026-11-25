@@ -1,4 +1,30 @@
-# VIctory fork (work in progress)
+# VIctory-Strich-Nvidia (work in progress)
+
+An NVIDIA / RTX-focused fork of [Hyphen's victory-fork](https://github.com/fxceless/victory-fork) (`0b0074e`), which itself builds on [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an Xbox Series title natively on Windows from user-supplied files.
+
+**This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated with or endorsed by the game's developer or publisher.
+
+## What this fork adds over `fxceless/victory-fork` (`0b0074e`)
+
+Tested on **Windows 11, NVIDIA GeForce RTX 5070 Ti 16 GB (Wave32-only)** with `--console series-x`:
+- **Restores missing character heads & faces + preserves indirect performance:** Turned off `VICTORY_INDIRECT_WINDOW` by default (which was dropping character head/face indirect draws in the cell) and ported indirect draw-clamp hoisting (`VICTORY_HOIST_CLAMPS=7` default, inspired by `Belobug/VIctory-Belobug-AMD`). Measured `3.5-3.9 fps` (`~256-288 ms/frame`, `0` indirect draws dropped) with full heads, faces, necks, and outside inmates rendering.
+- **Wave32 / NVIDIA shader & pipeline fixes (eliminating 5 of 6 refused compute pipelines + the refused mesh pipeline):**
+  - `VICTORY_LDS_EXACT` overlap checking (default on) + acyclic wave-wide `LoopContext`, placed UAV views (`View::Placed` unordered), and `HostHeap::dynamic` wraparound fix (`CS_Visibility`, `CS_Tiling_Generate_Opaque`).
+  - Helper-lane `v_readfirstlane` self-read fix, RDNA2 `image_sample_*_g16` 16-bit gradient packing, and console vertex element ordering + interpolation reconciliation (`MS_VS_PedTransformPreSkinD_Packed`).
+  - Wave32 ray-tracing structure builder / shadow-ray trace support (`SLOT_ADDRESSES`, missing child miss handling).
+  - Immediate samplers & nested descriptor phis chosen across control flow, `calculateLOD` array slice undef handling, and `SPI_SHADER_PGM_RSRC2_PS` zero-init for uninitialized pixel-shader SGPRs.
+  - Anisotropic mip-point `D3D12_OPTIONS19` static-sampler handling and `f16` interp `omod`/`clamp` lowering (`[mesh f5e50eb2108c425b, pixel ce3f0432a08f1d35]`), plus `VICTORY_REFUSED_DIR` diagnostics.
+  - Multi-wave `group_any` widen (`group > 64`), guarded resource reads, and `s_setpc` early-out stripping (`CS_AlphTransmissionPrefilterMip`, `CS_ShadowRenderTiledCascadesAlphaCBPPPC`).
+- **Launcher (`scripts/play.ps1`):** Launches `--execute --console series-x` with `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`, `VICTORY_COPY_PLAIN=1`, `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_LEVELS_ON_DEMAND=1`, and `VICTORY_INDIRECT_WINDOW` unset.
+
+```powershell
+cargo build --release -p victory
+.\scripts\play.ps1 -Game "C:\path\to\game_scarlett_master.exe"
+```
+
+---
+
+# Upstream VIctory fork notes (`fxceless/victory-fork`)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
@@ -6,17 +32,14 @@ files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
-
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors is the base of everything here: the loader, the runtime
   services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
+  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** (`0b0074e`) for the clean base, frame pipeline, and performance switches (`VICTORY_ASYNC_SUBMIT`, `VICTORY_QUEUE2`, `VICTORY_COPY_PLAIN`, `VICTORY_TEXTURE_NO_WAIT`, `VICTORY_LEVELS_ON_DEMAND`).
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** for the `VICTORY_HOIST_CLAMPS` indirect draw clamp-hoisting approach, and Victory contributors (**Yorivel**, **Vax**, **AscilCH**, **uiliannn**) for individual shader fixes carried here.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.

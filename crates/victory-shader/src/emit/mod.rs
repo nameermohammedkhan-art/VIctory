@@ -417,12 +417,12 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // With `VICTORY_WAVE_WIDE=1`, allow wave-wide widening even through loops; by default
+        // (unless `VICTORY_WAVE_WIDE=0`), allow acyclic wave-wide widening only so programs like
+        // `sr_tracing:CS_Tiling_Generate_Opaque` lower cleanly without placing group barriers in loops
+        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail` lost the card when widened through loops).
+        let wide_loops = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -452,7 +452,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, wide_loops);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -514,7 +514,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), true);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -551,10 +551,15 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    allow_loops: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
+    };
+    const LOOP: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "wave-wide branches inside or around a loop",
     };
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
@@ -568,6 +573,8 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    let loop_ctx = (!allow_loops).then(|| LoopContext::new(p));
+    let mut all_needs = std::collections::HashSet::new();
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
@@ -576,12 +583,22 @@ fn widen(
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
+        all_needs.extend(needs.iter().copied());
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            if let Some(ctx) = &loop_ctx
+                && r.is_ok()
+                && ctx.touches_loop(wide.iter().copied(), all_needs.iter().copied())
+            {
+                if why {
+                    eprintln!("WAVE64-WIDE skipped: {} widened branches touch a loop", wide.len());
+                }
+                return Err(LOOP);
+            }
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
@@ -592,6 +609,14 @@ fn widen(
             .into_iter()
             .filter(|b| !wide.contains(b))
             .collect();
+        if let Some(ctx) = &loop_ctx
+            && ctx.touches_loop(more.iter().copied(), needs.iter().copied())
+        {
+            if why {
+                eprintln!("WAVE64-WIDE skipped: candidate branch touches a loop");
+            }
+            return Err(LOOP);
+        }
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
@@ -599,6 +624,120 @@ fn widen(
             return r;
         }
         wide.extend(more);
+    }
+}
+
+/// Loop membership and forward-branch regions for checking whether [`widen`] stays acyclic.
+struct LoopContext {
+    succ: Vec<[Option<usize>; 2]>,
+    in_loop: Vec<bool>,
+    pdom: Vec<Vec<u64>>,
+}
+
+impl LoopContext {
+    fn new(p: &ir::Program) -> Self {
+        let n = p.blocks.len();
+        let order = ir::reverse_postorder(&p.blocks);
+        let mut rpo = vec![usize::MAX; n];
+        for (i, &b) in order.iter().enumerate() {
+            rpo[b] = i;
+        }
+        let succ: Vec<[Option<usize>; 2]> = p
+            .blocks
+            .iter()
+            .map(|b| match b.exit {
+                ir::Exit::Jump(t) => [Some(t), None],
+                ir::Exit::Branch { taken, not_taken } => [Some(taken), Some(not_taken)],
+                ir::Exit::End | ir::Exit::Indirect => [None, None],
+            })
+            .collect();
+        let mut in_loop = vec![false; n];
+        for (u, s) in succ.iter().enumerate() {
+            if rpo[u] == usize::MAX {
+                continue;
+            }
+            for h in s.into_iter().copied().flatten() {
+                if rpo[h] <= rpo[u] {
+                    in_loop[h] = true;
+                    let mut stack = vec![u];
+                    while let Some(x) = stack.pop() {
+                        if in_loop[x] || x == h {
+                            continue;
+                        }
+                        in_loop[x] = true;
+                        for &pred in &p.blocks[x].preds {
+                            if rpo[pred] != usize::MAX {
+                                stack.push(pred);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let words = n.div_ceil(64).max(1);
+        let full = vec![u64::MAX; words];
+        let mut pdom: Vec<Vec<u64>> = (0..n)
+            .map(|b| {
+                if succ[b].iter().all(Option::is_none) {
+                    let mut v = vec![0; words];
+                    v[b / 64] |= 1 << (b % 64);
+                    v
+                } else {
+                    full.clone()
+                }
+            })
+            .collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().rev() {
+                let outs: Vec<usize> = succ[b].into_iter().flatten().collect();
+                if outs.is_empty() {
+                    continue;
+                }
+                let mut v = full.clone();
+                for t in outs {
+                    for w in 0..words {
+                        v[w] &= pdom[t][w];
+                    }
+                }
+                v[b / 64] |= 1 << (b % 64);
+                if v != pdom[b] {
+                    pdom[b] = v;
+                    changed = true;
+                }
+            }
+        }
+        Self { succ, in_loop, pdom }
+    }
+
+    fn touches_loop(
+        &self,
+        branches: impl IntoIterator<Item = usize>,
+        needs: impl IntoIterator<Item = usize>,
+    ) -> bool {
+        if needs.into_iter().any(|b| self.in_loop[b]) {
+            return true;
+        }
+        let n = self.succ.len();
+        for d in branches {
+            if self.in_loop[d] {
+                return true;
+            }
+            let mut seen = vec![false; n];
+            let mut stack: Vec<usize> = self.succ[d].into_iter().flatten().collect();
+            while let Some(b) = stack.pop() {
+                if seen[b] || (self.pdom[d][b / 64] >> (b % 64)) & 1 == 1 {
+                    continue;
+                }
+                if self.in_loop[b] {
+                    return true;
+                }
+                seen[b] = true;
+                stack.extend(self.succ[b].into_iter().flatten());
+            }
+        }
+        false
     }
 }
 

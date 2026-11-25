@@ -1024,10 +1024,11 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             uses[r].push((lds_use(name), lds_dwords(&defs, i)));
         }
     }
-    // `VICTORY_LDS_EXACT=1`: a read and a write in one region are refused only where they may
-    // touch the same dword (an address not known is taken to touch every dword), and atomics of
-    // one order-free kind (add, min...) on the same dword do not need each other's order.
-    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1");
+    // `VICTORY_LDS_EXACT` (default ON; `0` turns it off): a read and a write in one region are
+    // refused only where they may touch the same dword (an address not known is taken to touch
+    // every dword), and atomics of one order-free kind (add, min...) on the same dword do not need
+    // each other's order.
+    let exact = std::env::var_os("VICTORY_LDS_EXACT").is_none_or(|v| v != "0");
     if (0..n).any(|r| reads[r] && writes[r] && (!exact || lds_conflict(&uses[r]))) {
         return None;
     }

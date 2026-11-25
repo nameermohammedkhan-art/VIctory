@@ -10215,7 +10215,15 @@ impl<'a> Lower<'a> {
                 }
             }
             if op == 81 {
-                // The clamped then the unclamped level of detail.
+                // The clamped then the unclamped level of detail. An array's
+                // slice is not part of the coordinates here: the host's
+                // `calculateLOD` wants it undef (a 2D array's third
+                // coordinate, a 1D array's second and third).
+                let (x0, x1, x2) = match kind {
+                    6 => (cs[0], fu, fu),
+                    7 => (cs[0], cs[1], fu),
+                    _ => (cs[0], cs[1], cs[2]),
+                };
                 let f32t = self.s.t.f32;
                 let lod_channels: Vec<u32> = (0..2u32).filter(|ch| dmask >> ch & 1 != 0).collect();
                 let lods: Vec<V> = if let Some(sh) = sampler_sel.0 {
@@ -10229,7 +10237,7 @@ impl<'a> Lower<'a> {
                                 Attr::ReadOnly,
                                 f32t,
                                 81,
-                                &[h, sh, cs[0], cs[1], cs[2], clamped],
+                                &[h, sh, x0, x1, x2, clamped],
                             )
                         })
                         .collect()
@@ -10259,7 +10267,7 @@ impl<'a> Lower<'a> {
                                 Attr::ReadOnly,
                                 f32t,
                                 81,
-                                &[h, sh, cs[0], cs[1], cs[2], clamped],
+                                &[h, sh, x0, x1, x2, clamped],
                             );
                             slot.push((lod, arm));
                         }

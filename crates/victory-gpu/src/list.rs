@@ -310,6 +310,7 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -340,6 +341,70 @@ fn cut(this: This, wait: ValueWait) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replay(host);
+    }
+}
+
+/// Closes any active hoisted-clamps list on `list` and pushes it into
+/// `list.earlier` ahead of `list.host`.
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    let taken = list.state.lock().unwrap_or_else(|e| e.into_inner()).take_hoist();
+    if let Some((clamps, waits)) = taken {
+        clamps.clamp_end();
+        clamps.close();
+        list.earlier.push(Part { waits, host: clamps });
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to a list before it and nothing since may
+/// have written arguments, the recording is cut here; a list for the clamps
+/// of the draws to come goes into `hoist`, and drawing continues in `next`
+/// with the state replayed.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if this.is_null() || !crate::indirect::hoisting() || crate::draw::windows() {
+        return;
+    }
+    // SAFETY: the title records into `this` on one thread at a time.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    {
+        let state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = list.host.as_ref() else {
+            return;
+        };
+        if state.hoists_into(current) {
+            return;
+        }
+    }
+    end_hoist(list);
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    crate::indirect::CUTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(next) = fresh_list() else {
+        return;
+    };
+    let (clamps, waits) = if current.is_worked() || crate::indirect::hoist_mode() == 5 {
+        let Some(clamps) = fresh_list() else {
+            return;
+        };
+        if let Some(old) = list.host.replace(next) {
+            old.close();
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: old });
+        }
+        (clamps, Vec::new())
+    } else {
+        let Some(old) = list.host.replace(next) else {
+            return;
+        };
+        (old, std::mem::take(&mut list.gate))
+    };
+    if let Some(next) = list.host.as_ref() {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.replay(next);
+        state.set_hoist(clamps, next, waits);
     }
 }
 
@@ -403,6 +468,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -626,8 +692,13 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.close();
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
+        if let Some(host) = list.host.as_ref() {
+            host.close();
+        }
     }
     S_OK
 }
@@ -827,6 +898,7 @@ extern "system" fn copy_buffer_region(
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
+        list.count_write();
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -911,6 +983,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(src),
         ) {
             list.defer_copy(to, from, a.min(b) as usize);
+            list.count_write();
         }
     }
     #[cfg(not(windows))]
@@ -1355,6 +1428,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && dst != 0
         && src != 0
     {
+        list.count_write();
         let len = len as usize;
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
@@ -1757,6 +1831,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2066,6 +2143,7 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         let Some(current) = list.host.as_ref() else {
             return;
         };

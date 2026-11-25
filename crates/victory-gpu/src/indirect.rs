@@ -346,6 +346,117 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
+/// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
+/// a list of their own before the list that draws, so that a run of draws
+/// is not interleaved with our dispatches; 3 for mesh dispatches only; 4 for
+/// draws only; 5 always cuts into a new clamps list; 6 cuts without
+/// hoisting; 7 as 1 with a UAV barrier between clamps (default — avoids
+/// budget races/flicker). `VICTORY_HOIST_CLAMPS=<n>` configures it.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        MODE.store(set, Ordering::Relaxed);
+        return set;
+    }
+    mode
+}
+
+/// Cuts made for hoisted clamps, and those skipped.
+pub(crate) static CUTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) = unsafe {
+        (
+            src.GetGPUVirtualAddress(),
+            count.map(|(b, _)| b.GetGPUVirtualAddress()),
+        )
+    };
+    if !src_base.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let fits = |offset: u64, len: u64| {
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= u64::from(u32::MAX))
+    };
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => {
+            if !base.is_multiple_of(4) {
+                return None;
+            }
+            (base, 1u32, off as u32)
+        }
+        (Some((_, off)), Some(base)) => {
+            if !base.is_multiple_of(4) {
+                return None;
+            }
+            (base.checked_add(off)?, 1, 0)
+        }
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // Mode 7: one clamp after another, so that the budget is charged in
+        // the order of the draws as it is when each clamp precedes its draw.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// [`bound`] for a window of records clamped ahead of the draws that will
 /// read them (`crate::draw`'s windows; no count buffer). The records past
 /// the ones the title filled are whatever the buffer holds, and each

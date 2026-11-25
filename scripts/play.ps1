@@ -1,6 +1,6 @@
 # Clean Hyphen launcher for normal play (no scripted presses, no frame capture).
-# Keeps VICTORY_INDIRECT_WINDOW unset so VICTORY_HOIST_CLAMPS=7 runs by default
-# without dropping head/character indirect draws.
+# Keeps VICTORY_INDIRECT_WINDOW and VICTORY_HOIST_CLAMPS unset (defaulting to
+# 0 per-draw clamps without dropping character heads or splitting hair/walls).
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [string]$Cache = "$env:LOCALAPPDATA\ztrx\cache",

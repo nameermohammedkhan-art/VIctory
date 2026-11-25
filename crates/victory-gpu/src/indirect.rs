@@ -346,12 +346,13 @@ pub(crate) fn bound(
     clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
 }
 
-/// How clamps of indirect draws are recorded: 0 each before its draw; 1 in
+/// How clamps of indirect draws are recorded: 0 each before its draw (default —
+/// avoids cold-pipeline dropped heads and Diner-to-Cell hair/wall artifacts); 1 in
 /// a list of their own before the list that draws, so that a run of draws
 /// is not interleaved with our dispatches; 3 for mesh dispatches only; 4 for
 /// draws only; 5 always cuts into a new clamps list; 6 cuts without
-/// hoisting; 7 as 1 with a UAV barrier between clamps (default — avoids
-/// budget races/flicker). `VICTORY_HOIST_CLAMPS=<n>` configures it.
+/// hoisting; 7 as 1 with a UAV barrier between clamps.
+/// `VICTORY_HOIST_CLAMPS=<n>` configures it.
 pub(crate) fn hoist_mode() -> u8 {
     use std::sync::atomic::{AtomicU8, Ordering};
     static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
@@ -360,7 +361,7 @@ pub(crate) fn hoist_mode() -> u8 {
         let set = std::env::var("VICTORY_HOIST_CLAMPS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(7);
+            .unwrap_or(0);
         MODE.store(set, Ordering::Relaxed);
         return set;
     }
